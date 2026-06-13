@@ -167,15 +167,19 @@ class Tmux:
             check=True,
         )
 
-    def send_command(self, cmd):
+    def send_command(self, cmd, sentinel_path=None):
         """Send a command string to the worker window via a temp script.
 
+        If sentinel_path is provided, the script touches it when done.
         This avoids tmux send-keys buffer limits on long commands.
         Uses mkstemp to avoid symlink attacks on predictable paths.
         """
         fd, script_path = tempfile.mkstemp(prefix="korc-", suffix=".sh")
+        script_body = f"#!/bin/bash\n{cmd}\n"
+        if sentinel_path:
+            script_body += f"touch {sentinel_path}\n"
         try:
-            os.write(fd, f"#!/bin/bash\n{cmd}\n".encode())
+            os.write(fd, script_body.encode())
         finally:
             os.close(fd)
         os.chmod(script_path, 0o700)
@@ -192,42 +196,12 @@ class Tmux:
         )
         return result.stdout.strip().split("\n")[0] if result.stdout.strip() else None
 
-    def wait_for_idle(self, poll_interval=5, timeout=1800):
-        """Wait until the pane's shell has no child processes.
-
-        First waits for a child process to appear (command starting),
-        then waits for it to disappear (command finished).
-        timeout: max seconds to wait (default 30 min)
-        """
+    def wait_for_sentinel(self, sentinel_path, poll_interval=5, timeout=1800):
+        """Wait for a sentinel file to appear, meaning the command finished."""
         start = time.time()
-        startup_timeout = 30  # seconds to wait for command to start
-
-        # Phase 1: wait for a child process to appear
-        while time.time() - start < startup_timeout:
-            pid = self.pane_pid()
-            if not pid:
-                time.sleep(1)
-                continue
-            child_check = subprocess.run(
-                ["pgrep", "-P", pid], capture_output=True,
-            )
-            if child_check.returncode == 0:
-                break  # child appeared, command is running
-            time.sleep(1)
-        else:
-            print("  [!] Warning: no child process detected within "
-                  f"{startup_timeout}s, proceeding to poll anyway",
-                  file=sys.stderr)
-
-        # Phase 2: wait for the child process to disappear
         while time.time() - start < timeout:
-            pid = self.pane_pid()
-            if not pid:
-                return True
-            child_check = subprocess.run(
-                ["pgrep", "-P", pid], capture_output=True,
-            )
-            if child_check.returncode != 0:
+            if os.path.exists(sentinel_path):
+                os.unlink(sentinel_path)
                 return True
             time.sleep(poll_interval)
         print(f"  [!] Timeout after {timeout}s waiting for agent", file=sys.stderr)
@@ -308,18 +282,19 @@ def create_branch(slug):
                   file=sys.stderr)
 
 
-def run_in_tmux(tmux, cmd, timeout=1800):
+def run_in_tmux(tmux, cmd, project_dir, timeout=1800):
     """Send a command to the tmux worker and wait for it to finish."""
-    tmux.send_command(cmd)
-    return tmux.wait_for_idle(timeout=timeout)
+    sentinel = os.path.join(project_dir, KISSKORC_DIR, "_sentinel")
+    # Remove stale sentinel
+    if os.path.exists(sentinel):
+        os.unlink(sentinel)
+    tmux.send_command(cmd, sentinel_path=sentinel)
+    return tmux.wait_for_sentinel(sentinel, timeout=timeout)
 
 
-def claude_cmd(prompt_file, batch=True):
-    """Build a claude command that reads its prompt from a file."""
-    if batch:
-        return f'claude -p --model {MODEL} --dangerously-skip-permissions "$(cat {prompt_file})"'
-    else:
-        return f'claude --model {MODEL} --dangerously-skip-permissions -p "$(cat {prompt_file})"'
+def claude_cmd(prompt_file):
+    """Build a claude -p command that reads its prompt from a file."""
+    return f'claude -p --model {MODEL} --dangerously-skip-permissions "$(cat {prompt_file})"'
 
 
 def write_prompt(project_dir, step_name, content):
@@ -342,7 +317,7 @@ def step_spec(tmux, feature, project_dir):
         spec_path=kp(project_dir, "SPEC.md"),
     )
     pf = write_prompt(project_dir, "spec", prompt)
-    run_in_tmux(tmux, claude_cmd(pf))
+    run_in_tmux(tmux, claude_cmd(pf), project_dir)
     ok = kf_exists(project_dir, "SPEC.md")
     print(f"  -> SPEC.md {'(written)' if ok else '(MISSING!)'}")
     return ok
@@ -356,7 +331,7 @@ def step_review_spec(tmux, project_dir):
         review_path=kp(project_dir, "review-spec.md"),
     )
     pf = write_prompt(project_dir, "review-spec", prompt)
-    run_in_tmux(tmux, claude_cmd(pf))
+    run_in_tmux(tmux, claude_cmd(pf), project_dir)
     print("  -> review-spec.md")
 
 
@@ -369,7 +344,7 @@ def step_encode(tmux, feature_slug, project_dir):
         makefile_path=kp(project_dir, mk_name),
     )
     pf = write_prompt(project_dir, "encode", prompt)
-    run_in_tmux(tmux, claude_cmd(pf))
+    run_in_tmux(tmux, claude_cmd(pf), project_dir)
     ok = kf_exists(project_dir, mk_name)
     print(f"  -> {mk_name} {'(written)' if ok else '(MISSING!)'}")
     return ok
@@ -384,7 +359,7 @@ def step_review_make(tmux, feature_slug, project_dir):
         review_path=kp(project_dir, "review-make.md"),
     )
     pf = write_prompt(project_dir, "review-make", prompt)
-    run_in_tmux(tmux, claude_cmd(pf))
+    run_in_tmux(tmux, claude_cmd(pf), project_dir)
     print("  -> review-make.md")
 
 
@@ -395,7 +370,7 @@ def step_implement(tmux, project_dir):
         spec_path=kp(project_dir, "SPEC.md"),
     )
     pf = write_prompt(project_dir, "implement", prompt)
-    run_in_tmux(tmux, claude_cmd(pf, batch=False))
+    run_in_tmux(tmux, claude_cmd(pf), project_dir)
     print("  -> implementation complete")
 
 
@@ -431,7 +406,7 @@ def step_fix_make(tmux, feature_slug, project_dir):
         review_path=kp(project_dir, "REVIEW.md"),
     )
     pf = write_prompt(project_dir, "fix-make", prompt)
-    run_in_tmux(tmux, claude_cmd(pf))
+    run_in_tmux(tmux, claude_cmd(pf), project_dir)
     print(f"  -> verify-{feature_slug}.mk updated")
 
 
@@ -443,7 +418,7 @@ def step_reimplement(tmux, project_dir):
         review_path=kp(project_dir, "REVIEW.md"),
     )
     pf = write_prompt(project_dir, "reimplement", prompt)
-    run_in_tmux(tmux, claude_cmd(pf, batch=False))
+    run_in_tmux(tmux, claude_cmd(pf), project_dir)
     print("  -> re-implementation complete")
 
 
@@ -457,7 +432,7 @@ def step_adversarial(tmux, project_dir):
         output_path=kp(project_dir, "adversarial-claude.md"),
     )
     pf = write_prompt(project_dir, "adversarial-claude", claude_prompt)
-    run_in_tmux(tmux, claude_cmd(pf))
+    run_in_tmux(tmux, claude_cmd(pf), project_dir)
     print("  -> adversarial-claude.md")
 
     # Codex review
@@ -467,7 +442,7 @@ def step_adversarial(tmux, project_dir):
     )
     pf = write_prompt(project_dir, "adversarial-codex", codex_prompt)
     codex_cmd_str = f'codex exec --full-auto -C {project_dir} "$(cat {pf})"'
-    run_in_tmux(tmux, codex_cmd_str)
+    run_in_tmux(tmux, codex_cmd_str, project_dir)
     print("  -> adversarial-codex.md")
 
     # Check for critical/major findings
@@ -487,7 +462,7 @@ def step_land(tmux, project_dir):
         codex_review_path=kp(project_dir, "adversarial-codex.md"),
     )
     pf = write_prompt(project_dir, "land", prompt)
-    run_in_tmux(tmux, claude_cmd(pf, batch=False))
+    run_in_tmux(tmux, claude_cmd(pf), project_dir)
     print("  -> landing complete")
 
 
