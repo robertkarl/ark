@@ -73,6 +73,11 @@ Rules:
 - The Makefile must work with `make -k` (keep going on failure)
 - Use standard unix tools only
 - Do NOT implement the feature — only write verification checks
+- CRITICAL: Test targets must complete quickly (under 10 seconds each). \
+Do NOT invoke commands that start long-running processes, spawn LLM agents, \
+or trigger full pipeline runs. For CLI flag tests, only check argument \
+parsing behavior (help text, error messages, exit codes) — never pipe \
+real input that would start an actual pipeline.
 - Write the Makefile to {makefile_path}
 """
 
