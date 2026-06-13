@@ -203,7 +203,7 @@ class Tmux:
     def send_command(self, cmd, sentinel_path=None):
         """Send a command string to the worker window via a temp script.
 
-        If sentinel_path is provided, the script touches it when done.
+        If sentinel_path is provided, the script writes it when done.
         This avoids tmux send-keys buffer limits on long commands.
         Uses mkstemp to avoid symlink attacks on predictable paths.
         """
@@ -325,7 +325,8 @@ def create_branch(slug):
                   file=sys.stderr)
 
 
-def run_in_tmux(tmux, cmd, project_dir, timeout=1800):
+def run_in_tmux(
+        tmux, cmd, project_dir, timeout=1800):
     """Send a command to the tmux worker and wait for it to finish.
 
     If the tmux session dies, recreates it and retries once.
@@ -347,23 +348,26 @@ def run_in_tmux(tmux, cmd, project_dir, timeout=1800):
 SKIP_PERMISSIONS = os.environ.get("KISSKORC_SKIP_PERMISSIONS", "1") == "1"
 
 
-def claude_cmd(prompt_file):
-    """Build a claude -p command that reads its prompt from a file.
+def claude_cmd(
+        prompt_file):
+    """Build an interactive claude command that reads its prompt from a file.
 
-    Uses stdin redirection (< file) instead of $(cat file) inside double quotes
-    to prevent shell interpretation of prompt file contents.
+    Uses $(cat file) command substitution inside double quotes as a positional
+    argument, so the prompt streams visibly as the agent works.
     """
     _validate_model()
     skip = " --dangerously-skip-permissions" if SKIP_PERMISSIONS else ""
-    return f'claude -p --model {shlex.quote(MODEL)}{skip} < {shlex.quote(prompt_file)}'
+    return f'claude --model {shlex.quote(MODEL)}{skip} "$(cat {shlex.quote(prompt_file)})"'
 
 
-def codex_cmd(prompt_file, project_dir):
+def codex_cmd(
+        prompt_file, project_dir):
     """Build a codex exec command that reads its prompt from a file."""
     return f'prompt=$(<{shlex.quote(prompt_file)}) && codex exec --full-auto -C {shlex.quote(project_dir)} "$prompt"'
 
 
-def driver_cmd(prompt_file, project_dir, driver="claude"):
+def driver_cmd(
+        prompt_file, project_dir, driver="claude"):
     """Build the right agent command based on the driver."""
     if driver == "codex":
         return codex_cmd(prompt_file, project_dir)
@@ -382,7 +386,8 @@ def write_prompt(project_dir, step_name, content):
 # ---------------------------------------------------------------------------
 
 
-def step_spec(tmux, feature, project_dir):
+def step_spec(
+        tmux, feature, project_dir):
     """Turn feature description into a spec."""
     print("[step:spec] Writing specification...")
     prompt = PROMPT_SPEC.format(
@@ -396,7 +401,8 @@ def step_spec(tmux, feature, project_dir):
     return ok
 
 
-def step_review_spec(tmux, project_dir):
+def step_review_spec(
+        tmux, project_dir):
     """Review the spec with fresh context."""
     print("[step:review-spec] Reviewing specification...")
     prompt = PROMPT_REVIEW_SPEC.format(
@@ -408,7 +414,8 @@ def step_review_spec(tmux, project_dir):
     print("  -> review-spec.md")
 
 
-def step_encode(tmux, feature_slug, project_dir):
+def step_encode(
+        tmux, feature_slug, project_dir):
     """Turn spec into a verification Makefile."""
     print("[step:encode] Writing verification Makefile...")
     mk_name = f"verify-{feature_slug}.mk"
@@ -423,7 +430,8 @@ def step_encode(tmux, feature_slug, project_dir):
     return ok
 
 
-def step_review_make(tmux, feature_slug, project_dir):
+def step_review_make(
+        tmux, feature_slug, project_dir):
     """Review the Makefile with fresh context."""
     print("[step:review-make] Reviewing Makefile...")
     prompt = PROMPT_REVIEW_MAKE.format(
@@ -436,7 +444,8 @@ def step_review_make(tmux, feature_slug, project_dir):
     print("  -> review-make.md")
 
 
-def step_implement(tmux, project_dir, driver="claude"):
+def step_implement(
+        tmux, project_dir, driver="claude"):
     """Have an agent implement the spec."""
     print(f"[step:implement] Implementing (driver={driver})...")
     prompt = PROMPT_IMPLEMENT.format(
@@ -476,7 +485,8 @@ def step_verify(feature_slug, project_dir):
     return passed
 
 
-def step_fix_make(tmux, feature_slug, project_dir):
+def step_fix_make(
+        tmux, feature_slug, project_dir):
     """Fix Makefile issues with fresh context."""
     print("[step:fix-make] Fixing Makefile...")
     prompt = PROMPT_FIX_MAKE.format(
@@ -488,7 +498,8 @@ def step_fix_make(tmux, feature_slug, project_dir):
     print(f"  -> verify-{feature_slug}.mk updated")
 
 
-def step_reimplement(tmux, project_dir, driver="claude"):
+def step_reimplement(
+        tmux, project_dir, driver="claude"):
     """Reimplement with spec + review context."""
     print(f"[step:reimplement] Re-implementing (driver={driver})...")
     prompt = PROMPT_REIMPLEMENT.format(
@@ -500,7 +511,8 @@ def step_reimplement(tmux, project_dir, driver="claude"):
     print("  -> re-implementation complete")
 
 
-def step_adversarial(tmux, project_dir):
+def step_adversarial(
+        tmux, project_dir):
     """Spawn two adversarial reviewers sequentially."""
     print("[step:adversarial] Adversarial review...")
 
@@ -536,7 +548,8 @@ def step_adversarial(tmux, project_dir):
     return False
 
 
-def step_land(tmux, project_dir):
+def step_land(
+        tmux, project_dir):
     """Fresh agent addresses adversarial findings. Interactive."""
     print("[step:land] Addressing adversarial findings...")
     prompt = PROMPT_LAND.format(
