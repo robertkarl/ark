@@ -5,7 +5,8 @@ No LLM in the loop. Just a script that runs a fixed pipeline,
 spawning fresh-context agents at each step.
 
 Usage:
-    cat feature.txt | kiss-korc new
+    echo 'Add a feature' | kiss-korc new
+    kiss-korc archive
 """
 
 # TODO: add the option for korc to spin up agents when it wants/needs
@@ -13,20 +14,22 @@ Usage:
 
 import os
 import re
-import shlex
+import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Prompts — each agent gets only what it needs, nothing more
+# Prompts — each agent gets only what it needs, nothing more.
+# Agents read/write files by path. No prompt contains file contents inline.
 # ---------------------------------------------------------------------------
 
 PROMPT_SPEC = """\
 You are a specification writer. Explore the current project to understand \
-its structure, then turn the feature description below into a clear, \
-testable specification document.
+its structure, then turn the feature description in {feature_path} into a \
+clear, testable specification document.
 
 Requirements:
 - Each requirement must be independently testable
@@ -34,9 +37,6 @@ Requirements:
 - Include edge cases and error conditions
 - Do NOT include implementation details or code
 - Write the final spec to {spec_path}
-
-Feature description:
-{feature}
 """
 
 PROMPT_REVIEW_SPEC = """\
@@ -149,58 +149,71 @@ MAX_LOOPS = 3
 KISSKORC_DIR = ".kisskorc"
 
 # ---------------------------------------------------------------------------
-# Tmux helpers
+# Tmux helpers — kiss_korc runs in your terminal, tmux is the worker
 # ---------------------------------------------------------------------------
 
 
 class Tmux:
-    """Thin wrapper around tmux commands. No magic."""
+    """Manage a single tmux session with one window for the worker agent."""
 
     def __init__(self, session_name):
         self.session = session_name
 
-    def create_session(self):
+    def create_session(self, working_dir):
+        """Create a detached tmux session."""
         subprocess.run(
-            ["tmux", "new-session", "-d", "-s", self.session, "-x", "200", "-y", "50"],
+            ["tmux", "new-session", "-d", "-s", self.session, "-c", working_dir],
             check=True,
         )
 
-    def split_pane(self):
-        """Split horizontally — pane 0 is korc, pane 1 is the worker."""
+    def send_command(self, cmd):
+        """Send a command string to the worker window via a temp script.
+
+        This avoids tmux send-keys buffer limits on long commands.
+        """
+        script = Path("/tmp") / f"korc-{self.session}.sh"
+        script.write_text(f"#!/bin/bash\n{cmd}\n")
+        script.chmod(0o755)
         subprocess.run(
-            ["tmux", "split-window", "-h", "-t", f"{self.session}:0"],
+            ["tmux", "send-keys", "-t", self.session, f"bash {script}", "Enter"],
             check=True,
         )
 
-    def send_keys(self, cmd):
-        """Send a command to pane 1 (the worker pane)."""
-        subprocess.run(
-            ["tmux", "send-keys", "-t", f"{self.session}:0.1", cmd, "Enter"],
-            check=True,
-        )
-
-    def worker_pane_pid(self):
-        """Get the shell PID of pane 1."""
+    def pane_pid(self):
+        """Get the shell PID of the worker pane."""
         result = subprocess.run(
-            ["tmux", "list-panes", "-t", f"{self.session}:0", "-F", "#{pane_pid}"],
+            ["tmux", "list-panes", "-t", self.session, "-F", "#{pane_pid}"],
             capture_output=True, text=True,
         )
-        pids = result.stdout.strip().split("\n")
-        return pids[1] if len(pids) > 1 else None
+        return result.stdout.strip().split("\n")[0] if result.stdout.strip() else None
 
-    def wait_for_idle(self, poll_interval=5):
-        """Wait until pane 1's shell has no child processes."""
-        while True:
-            pid = self.worker_pane_pid()
+    def wait_for_idle(self, poll_interval=5, timeout=1800):
+        """Wait until the pane's shell has no child processes.
+
+        timeout: max seconds to wait (default 30 min)
+        """
+        start = time.time()
+        time.sleep(2)  # let the command start
+        while time.time() - start < timeout:
+            pid = self.pane_pid()
             if not pid:
-                break
+                return True
             child_check = subprocess.run(
-                ["pgrep", "-P", pid],
-                capture_output=True,
+                ["pgrep", "-P", pid], capture_output=True,
             )
             if child_check.returncode != 0:
-                break
+                return True
             time.sleep(poll_interval)
+        print(f"  [!] Timeout after {timeout}s waiting for agent", file=sys.stderr)
+        return False
+
+    def is_alive(self):
+        """Check if the tmux session still exists."""
+        result = subprocess.run(
+            ["tmux", "has-session", "-t", self.session],
+            capture_output=True,
+        )
+        return result.returncode == 0
 
     def kill_session(self):
         subprocess.run(
@@ -214,14 +227,15 @@ class Tmux:
 # ---------------------------------------------------------------------------
 
 
-def korc_path(project_dir, filename):
-    """Return a path inside .kisskorc/."""
+def kp(project_dir, filename):
+    """Return absolute path inside .kisskorc/."""
     return str(Path(project_dir) / KISSKORC_DIR / filename)
 
 
-def korc_file_exists(project_dir, filename):
-    """Check if a .kisskorc/ artifact exists."""
-    return (Path(project_dir) / KISSKORC_DIR / filename).exists()
+def kf_exists(project_dir, filename):
+    """Check if a .kisskorc/ artifact exists and is non-empty."""
+    p = Path(project_dir) / KISSKORC_DIR / filename
+    return p.exists() and p.stat().st_size > 0
 
 
 def slugify(text):
@@ -238,44 +252,49 @@ def ensure_dir(project_dir):
 
 
 def create_branch(slug):
-    """Create and checkout a korc/ branch."""
+    """Create and checkout a korc/ branch. Stashes if dirty."""
+    # Check for dirty working tree
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], capture_output=True, text=True,
+    )
+    stashed = False
+    if status.stdout.strip():
+        print("  Stashing uncommitted changes...")
+        subprocess.run(["git", "stash", "push", "-m", f"korc-{slug}-autostash"], check=True)
+        stashed = True
+
     branch = f"korc/{slug}"
     result = subprocess.run(
-        ["git", "rev-parse", "--verify", branch],
-        capture_output=True,
+        ["git", "rev-parse", "--verify", branch], capture_output=True,
     )
     if result.returncode == 0:
         subprocess.run(["git", "checkout", branch], check=True)
     else:
         subprocess.run(["git", "checkout", "-b", branch], check=True)
 
-
-def run_in_pane(tmux, cmd):
-    """Send a command to the worker pane and wait for it to finish."""
-    tmux.send_keys(cmd)
-    time.sleep(1)  # let the process start
-    tmux.wait_for_idle()
+    if stashed:
+        subprocess.run(["git", "stash", "pop"], capture_output=True)
 
 
-def build_claude_batch_cmd(prompt):
-    """Build a claude -p command as a string for send-keys."""
-    return shlex.join([
-        "claude", "-p",
-        "--model", MODEL,
-        "--dangerously-skip-permissions",
-        prompt,
-    ])
+def run_in_tmux(tmux, cmd, timeout=1800):
+    """Send a command to the tmux worker and wait for it to finish."""
+    tmux.send_command(cmd)
+    return tmux.wait_for_idle(timeout=timeout)
 
 
-def build_claude_interactive_cmd(prompt):
-    """Build an interactive claude command as a string for send-keys."""
-    return shlex.join([
-        "claude",
-        "--model", MODEL,
-        "--dangerously-skip-permissions",
-        "-p",
-        prompt,
-    ])
+def claude_cmd(prompt_file, batch=True):
+    """Build a claude command that reads its prompt from a file."""
+    if batch:
+        return f'claude -p --model {MODEL} --dangerously-skip-permissions "$(cat {prompt_file})"'
+    else:
+        return f'claude --model {MODEL} --dangerously-skip-permissions -p "$(cat {prompt_file})"'
+
+
+def write_prompt(project_dir, step_name, content):
+    """Write a prompt to a temp file, return its path."""
+    p = Path(project_dir) / KISSKORC_DIR / f"_prompt_{step_name}.md"
+    p.write_text(content)
+    return str(p)
 
 
 # ---------------------------------------------------------------------------
@@ -287,54 +306,64 @@ def step_spec(tmux, feature, project_dir):
     """Turn feature description into a spec."""
     print("[step:spec] Writing specification...")
     prompt = PROMPT_SPEC.format(
-        feature=feature,
-        spec_path=korc_path(project_dir, "SPEC.md"),
+        feature_path=kp(project_dir, "FEATURE.md"),
+        spec_path=kp(project_dir, "SPEC.md"),
     )
-    run_in_pane(tmux, build_claude_batch_cmd(prompt))
-    print("  -> SPEC.md")
+    pf = write_prompt(project_dir, "spec", prompt)
+    run_in_tmux(tmux, claude_cmd(pf))
+    ok = kf_exists(project_dir, "SPEC.md")
+    print(f"  -> SPEC.md {'(written)' if ok else '(MISSING!)'}")
+    return ok
 
 
 def step_review_spec(tmux, project_dir):
     """Review the spec with fresh context."""
     print("[step:review-spec] Reviewing specification...")
     prompt = PROMPT_REVIEW_SPEC.format(
-        spec_path=korc_path(project_dir, "SPEC.md"),
-        review_path=korc_path(project_dir, "review-spec.md"),
+        spec_path=kp(project_dir, "SPEC.md"),
+        review_path=kp(project_dir, "review-spec.md"),
     )
-    run_in_pane(tmux, build_claude_batch_cmd(prompt))
+    pf = write_prompt(project_dir, "review-spec", prompt)
+    run_in_tmux(tmux, claude_cmd(pf))
     print("  -> review-spec.md")
 
 
 def step_encode(tmux, feature_slug, project_dir):
     """Turn spec into a verification Makefile."""
     print("[step:encode] Writing verification Makefile...")
+    mk_name = f"verify-{feature_slug}.mk"
     prompt = PROMPT_ENCODE.format(
-        spec_path=korc_path(project_dir, "SPEC.md"),
-        makefile_path=korc_path(project_dir, f"verify-{feature_slug}.mk"),
+        spec_path=kp(project_dir, "SPEC.md"),
+        makefile_path=kp(project_dir, mk_name),
     )
-    run_in_pane(tmux, build_claude_batch_cmd(prompt))
-    print(f"  -> verify-{feature_slug}.mk")
+    pf = write_prompt(project_dir, "encode", prompt)
+    run_in_tmux(tmux, claude_cmd(pf))
+    ok = kf_exists(project_dir, mk_name)
+    print(f"  -> {mk_name} {'(written)' if ok else '(MISSING!)'}")
+    return ok
 
 
 def step_review_make(tmux, feature_slug, project_dir):
     """Review the Makefile with fresh context."""
     print("[step:review-make] Reviewing Makefile...")
     prompt = PROMPT_REVIEW_MAKE.format(
-        spec_path=korc_path(project_dir, "SPEC.md"),
-        makefile_path=korc_path(project_dir, f"verify-{feature_slug}.mk"),
-        review_path=korc_path(project_dir, "review-make.md"),
+        spec_path=kp(project_dir, "SPEC.md"),
+        makefile_path=kp(project_dir, f"verify-{feature_slug}.mk"),
+        review_path=kp(project_dir, "review-make.md"),
     )
-    run_in_pane(tmux, build_claude_batch_cmd(prompt))
+    pf = write_prompt(project_dir, "review-make", prompt)
+    run_in_tmux(tmux, claude_cmd(pf))
     print("  -> review-make.md")
 
 
 def step_implement(tmux, project_dir):
-    """Have an agent implement the spec. Interactive — user can watch/intervene."""
-    print("[step:implement] Implementing...")
+    """Have an agent implement the spec. Interactive — user can intervene."""
+    print("[step:implement] Implementing (interactive)...")
     prompt = PROMPT_IMPLEMENT.format(
-        spec_path=korc_path(project_dir, "SPEC.md"),
+        spec_path=kp(project_dir, "SPEC.md"),
     )
-    run_in_pane(tmux, build_claude_interactive_cmd(prompt))
+    pf = write_prompt(project_dir, "implement", prompt)
+    run_in_tmux(tmux, claude_cmd(pf, batch=False))
     print("  -> implementation complete")
 
 
@@ -342,6 +371,9 @@ def step_verify(feature_slug, project_dir):
     """Run the verification Makefile. Returns True if all checks pass."""
     print("[step:verify] Running verification...")
     mk_path = Path(project_dir) / KISSKORC_DIR / f"verify-{feature_slug}.mk"
+    if not mk_path.exists():
+        print("  [!] Makefile not found, skipping verify")
+        return False
     result = subprocess.run(
         ["make", "-k", "-f", str(mk_path)],
         capture_output=True, text=True,
@@ -350,55 +382,60 @@ def step_verify(feature_slug, project_dir):
     output = f"exit code: {result.returncode}\n\nstdout:\n{result.stdout}\n\nstderr:\n{result.stderr}"
     review_path = Path(project_dir) / KISSKORC_DIR / "REVIEW.md"
     review_path.write_text(output)
-    print(f"  -> exit code {result.returncode}")
-    return result.returncode == 0
+    passed = result.returncode == 0
+    print(f"  -> {'PASS' if passed else 'FAIL'} (exit {result.returncode})")
+    if not passed and result.stderr:
+        # Show first few lines of errors
+        for line in result.stderr.strip().split("\n")[:5]:
+            print(f"     {line}")
+    return passed
 
 
 def step_fix_make(tmux, feature_slug, project_dir):
     """Fix Makefile issues with fresh context."""
     print("[step:fix-make] Fixing Makefile...")
     prompt = PROMPT_FIX_MAKE.format(
-        makefile_path=korc_path(project_dir, f"verify-{feature_slug}.mk"),
-        review_path=korc_path(project_dir, "REVIEW.md"),
+        makefile_path=kp(project_dir, f"verify-{feature_slug}.mk"),
+        review_path=kp(project_dir, "REVIEW.md"),
     )
-    run_in_pane(tmux, build_claude_batch_cmd(prompt))
+    pf = write_prompt(project_dir, "fix-make", prompt)
+    run_in_tmux(tmux, claude_cmd(pf))
     print(f"  -> verify-{feature_slug}.mk updated")
 
 
 def step_reimplement(tmux, project_dir):
     """Reimplement with spec + review context. Interactive."""
-    print("[step:reimplement] Re-implementing...")
+    print("[step:reimplement] Re-implementing (interactive)...")
     prompt = PROMPT_REIMPLEMENT.format(
-        spec_path=korc_path(project_dir, "SPEC.md"),
-        review_path=korc_path(project_dir, "REVIEW.md"),
+        spec_path=kp(project_dir, "SPEC.md"),
+        review_path=kp(project_dir, "REVIEW.md"),
     )
-    run_in_pane(tmux, build_claude_interactive_cmd(prompt))
+    pf = write_prompt(project_dir, "reimplement", prompt)
+    run_in_tmux(tmux, claude_cmd(pf, batch=False))
     print("  -> re-implementation complete")
 
 
 def step_adversarial(tmux, project_dir):
-    """Spawn two adversarial reviewers (claude + codex) sequentially in pane."""
+    """Spawn two adversarial reviewers sequentially."""
     print("[step:adversarial] Adversarial review...")
 
     # Claude review
     claude_prompt = PROMPT_ADVERSARIAL.format(
-        spec_path=korc_path(project_dir, "SPEC.md"),
-        output_path=korc_path(project_dir, "adversarial-claude.md"),
+        spec_path=kp(project_dir, "SPEC.md"),
+        output_path=kp(project_dir, "adversarial-claude.md"),
     )
-    run_in_pane(tmux, build_claude_batch_cmd(claude_prompt))
+    pf = write_prompt(project_dir, "adversarial-claude", claude_prompt)
+    run_in_tmux(tmux, claude_cmd(pf))
     print("  -> adversarial-claude.md")
 
     # Codex review
     codex_prompt = PROMPT_ADVERSARIAL.format(
-        spec_path=korc_path(project_dir, "SPEC.md"),
-        output_path=korc_path(project_dir, "adversarial-codex.md"),
+        spec_path=kp(project_dir, "SPEC.md"),
+        output_path=kp(project_dir, "adversarial-codex.md"),
     )
-    codex_cmd = shlex.join([
-        "codex", "exec", "--full-auto",
-        "-C", project_dir,
-        codex_prompt,
-    ])
-    run_in_pane(tmux, codex_cmd)
+    pf = write_prompt(project_dir, "adversarial-codex", codex_prompt)
+    codex_cmd_str = f'codex exec --full-auto -C {project_dir} "$(cat {pf})"'
+    run_in_tmux(tmux, codex_cmd_str)
     print("  -> adversarial-codex.md")
 
     # Check for critical/major findings
@@ -413,11 +450,12 @@ def step_land(tmux, project_dir):
     """Fresh agent addresses adversarial findings. Interactive."""
     print("[step:land] Addressing adversarial findings...")
     prompt = PROMPT_LAND.format(
-        spec_path=korc_path(project_dir, "SPEC.md"),
-        claude_review_path=korc_path(project_dir, "adversarial-claude.md"),
-        codex_review_path=korc_path(project_dir, "adversarial-codex.md"),
+        spec_path=kp(project_dir, "SPEC.md"),
+        claude_review_path=kp(project_dir, "adversarial-claude.md"),
+        codex_review_path=kp(project_dir, "adversarial-codex.md"),
     )
-    run_in_pane(tmux, build_claude_interactive_cmd(prompt))
+    pf = write_prompt(project_dir, "land", prompt)
+    run_in_tmux(tmux, claude_cmd(pf, batch=False))
     print("  -> landing complete")
 
 
@@ -425,6 +463,9 @@ def step_ship(feature_slug, project_dir):
     """Final step: verify everything passes and declare ready."""
     print("[step:ship] Final verification...")
     mk_path = Path(project_dir) / KISSKORC_DIR / f"verify-{feature_slug}.mk"
+    if not mk_path.exists():
+        print("  [!] No Makefile found. Cannot ship.")
+        return False
     result = subprocess.run(
         ["make", "-k", "-f", str(mk_path)],
         capture_output=True, text=True,
@@ -434,7 +475,7 @@ def step_ship(feature_slug, project_dir):
         print(f"  SHIP IT. Branch korc/{feature_slug} is ready to merge.")
         return True
     else:
-        print(f"  [!] Final verification failed. Check .kisskorc/REVIEW.md")
+        print("  [!] Final verification failed.")
         review_path = Path(project_dir) / KISSKORC_DIR / "REVIEW.md"
         output = f"exit code: {result.returncode}\n\nstdout:\n{result.stdout}\n\nstderr:\n{result.stderr}"
         review_path.write_text(output)
@@ -444,16 +485,6 @@ def step_ship(feature_slug, project_dir):
 # ---------------------------------------------------------------------------
 # Resume logic
 # ---------------------------------------------------------------------------
-
-STEPS = [
-    "spec",
-    "review-spec",
-    "encode",
-    "review-make",
-    "implement",
-    "verify",
-    # steps 5-8 loop, handled separately
-]
 
 
 def detect_resume_point(feature_slug, project_dir):
@@ -466,7 +497,7 @@ def detect_resume_point(feature_slug, project_dir):
     ]
     last_completed = None
     for step_name, filename in checks:
-        if korc_file_exists(project_dir, filename):
+        if kf_exists(project_dir, filename):
             last_completed = step_name
         else:
             break
@@ -474,6 +505,38 @@ def detect_resume_point(feature_slug, project_dir):
     if last_completed:
         print(f"  Resuming after: {last_completed}")
     return last_completed
+
+
+# ---------------------------------------------------------------------------
+# Archive
+# ---------------------------------------------------------------------------
+
+
+def archive_run(project_dir, label=None):
+    """Copy .kisskorc/ artifacts to .kisskorc/archive/<timestamp>/."""
+    korc_dir = Path(project_dir) / KISSKORC_DIR
+    if not korc_dir.exists():
+        print("Nothing to archive — no .kisskorc/ directory", file=sys.stderr)
+        return
+
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    if label:
+        archive_name = f"{ts}-{label}"
+    else:
+        archive_name = ts
+
+    archive_dir = korc_dir / "archive" / archive_name
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    # Copy all non-archive, non-prompt artifacts
+    for f in korc_dir.iterdir():
+        if f.name == "archive" or f.name.startswith("_prompt_"):
+            continue
+        if f.is_file():
+            shutil.copy2(f, archive_dir / f.name)
+
+    print(f"  Archived to {archive_dir}")
+    return archive_dir
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +554,7 @@ def run_pipeline(feature, project_dir):
     print(f"kiss_korc: {feature_slug}")
     print(f"  project: {project_dir}")
     print(f"  artifacts: {korc_dir}")
+    print(f"  tmux: {session_name}")
     print()
 
     # Save feature description
@@ -504,15 +568,18 @@ def run_pipeline(feature, project_dir):
     # Check resume point
     resume_after = detect_resume_point(feature_slug, project_dir)
 
-    # Create tmux session
+    # Create tmux session (kill old one if exists)
     tmux = Tmux(session_name)
     tmux.kill_session()
-    tmux.create_session()
-    tmux.split_pane()
+    tmux.create_session(project_dir)
+
+    print(f"  Attach with: tmux attach -t {session_name}\n")
 
     # Phase 1: Spec
     if resume_after is None:
-        step_spec(tmux, feature, project_dir)
+        if not step_spec(tmux, feature, project_dir):
+            print("  [!] Spec step failed to produce SPEC.md")
+            return 1
         resume_after = "spec"
 
     if resume_after == "spec":
@@ -521,7 +588,9 @@ def run_pipeline(feature, project_dir):
 
     # Phase 2: Encode verification
     if resume_after == "review-spec":
-        step_encode(tmux, feature_slug, project_dir)
+        if not step_encode(tmux, feature_slug, project_dir):
+            print("  [!] Encode step failed to produce Makefile")
+            return 1
         resume_after = "encode"
 
     if resume_after == "encode":
@@ -547,6 +616,7 @@ def run_pipeline(feature, project_dir):
 
     if not passed:
         print(f"\n  FAILED after {MAX_LOOPS} attempts.")
+        archive_run(project_dir, feature_slug)
         return 1
 
     # Phase 4: Adversarial review
@@ -557,10 +627,12 @@ def run_pipeline(feature, project_dir):
         step_land(tmux, project_dir)
 
     # Phase 6: Ship
-    if step_ship(feature_slug, project_dir):
-        return 0
-    else:
-        return 1
+    result = 0 if step_ship(feature_slug, project_dir) else 1
+
+    # Archive results
+    archive_run(project_dir, feature_slug)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -569,22 +641,34 @@ def run_pipeline(feature, project_dir):
 
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] != "new":
-        print("Usage: cat feature.txt | kiss-korc new", file=sys.stderr)
+    if len(sys.argv) < 2:
+        print("Usage: echo 'feature' | kiss-korc new", file=sys.stderr)
+        print("       kiss-korc archive [label]", file=sys.stderr)
         sys.exit(1)
 
-    if sys.stdin.isatty():
-        print("Error: pipe a feature description to stdin", file=sys.stderr)
-        print("  echo 'Add auth' | kiss-korc new", file=sys.stderr)
-        sys.exit(1)
+    cmd = sys.argv[1]
 
-    feature = sys.stdin.read().strip()
-    if not feature:
-        print("Error: empty feature description", file=sys.stderr)
-        sys.exit(1)
+    if cmd == "archive":
+        label = sys.argv[2] if len(sys.argv) > 2 else None
+        archive_run(os.getcwd(), label)
+        return
 
-    project_dir = os.getcwd()
-    sys.exit(run_pipeline(feature, project_dir))
+    if cmd == "new":
+        if sys.stdin.isatty():
+            print("Error: pipe a feature description to stdin", file=sys.stderr)
+            print("  echo 'Add auth' | kiss-korc new", file=sys.stderr)
+            sys.exit(1)
+
+        feature = sys.stdin.read().strip()
+        if not feature:
+            print("Error: empty feature description", file=sys.stderr)
+            sys.exit(1)
+
+        project_dir = os.getcwd()
+        sys.exit(run_pipeline(feature, project_dir))
+
+    print(f"Unknown command: {cmd}", file=sys.stderr)
+    sys.exit(1)
 
 
 if __name__ == "__main__":
