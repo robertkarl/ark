@@ -1,7 +1,7 @@
 __pycache__/
 *.pyc
 *.pyo
-.kisskorc/
+.ark/
 *.egg-info/
 dist/
 build/

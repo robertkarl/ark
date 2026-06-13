@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""kiss_korc - A dumb Python orchestrator for LLM agents.
+"""ark - A dumb Python orchestrator for LLM agents.
 
 No LLM in the loop. Just a script that runs a fixed pipeline,
 spawning fresh-context agents at each step.
 
 Usage:
-    echo 'Add a feature' | kiss-korc new
-    kiss-korc archive
+    echo 'Add a feature' | ark new
+    ark archive
 """
 
-# TODO: add the option for korc to spin up agents when it wants/needs
+# TODO: add the option for ark to spin up agents when it wants/needs
 # some judgement (like, "is this work good enough?")
 
 import functools
@@ -33,6 +33,11 @@ print = functools.partial(print, flush=True)
 # Prompts — each agent gets only what it needs, nothing more.
 # Agents read/write files by path. No prompt contains file contents inline.
 # ---------------------------------------------------------------------------
+
+PROMPT_SENTINEL = """
+IMPORTANT: When you are completely finished with your task, create this \
+file to signal completion: {sentinel_path}
+"""
 
 PROMPT_SPEC = """\
 You are a specification writer. Explore the current project to understand \
@@ -100,7 +105,7 @@ You are an implementer. Read the spec at {spec_path} and implement it in \
 the current project.
 
 Rules:
-- Do not modify anything under .kisskorc/
+- Do not modify anything under .ark/
 - Do not merge branches. Do not run git merge. Commit on the current branch only.
 - Do not push to any remote.
 """
@@ -111,7 +116,7 @@ Read the spec at {spec_path} and the verification results at {review_path}, \
 then fix the implementation.
 
 Rules:
-- Do not modify anything under .kisskorc/
+- Do not modify anything under .ark/
 - Do not merge branches. Do not run git merge. Commit on the current branch only.
 - Do not push to any remote.
 """
@@ -127,26 +132,60 @@ Overwrite {makefile_path} with the corrected version.
 """
 
 PROMPT_ADVERSARIAL = """\
-You are an adversarial code reviewer. Your job is to find bugs, security \
-issues, missing edge cases, and spec violations.
+You are a fresh-context code reviewer. You have ZERO knowledge of the build \
+process. You review only the diff and the codebase as it exists right now.
 
-Be harsh. Be thorough. Assume nothing works until proven otherwise.
-Output a numbered list of findings. For each finding, state:
-- What is wrong
-- Where in the code (file + function/line)
-- Severity (critical / major / minor)
+Step 1: Gather the diff.
+Run: git diff main...HEAD
+If the diff is empty, write "Nothing to review" to {output_path} and stop.
 
-Read the spec at {spec_path}, then review the code in the current working \
-directory against it. Write your findings to {output_path}.
+Step 2: Read context.
+For each file touched in the diff, read enough surrounding code to understand \
+the change in context. Do not read the entire codebase. Focus on what the diff touches.
+
+Step 3: Review with precision over recall.
+For each potential finding, ask yourself:
+1. Am I at least 80% confident this is a real issue? If not, skip it.
+2. Can I point to a specific file and line? If not, skip it.
+3. Is this a real defect, or just a style preference? Skip style preferences.
+An empty report is a valid outcome. Do not manufacture findings to look thorough.
+
+Read the spec at {spec_path} for context on what was intended.
+
+Step 4: Write your report to {output_path} using this format:
+
+## Code Review
+**Verdict: PASS / FAIL** (PASS = 0 BLOCKs, FAIL = 1+ BLOCKs)
+
+### Findings
+
+#### BLOCK: title
+- **File:** path:line
+- **Evidence:** what you see in the code
+- **Impact:** what goes wrong
+
+#### WARN: title
+- **File:** path:line
+- **Evidence:** what you see in the code
+- **Risk:** what could go wrong
+
+#### NOTE: title (low urgency, may be intentional)
+
+Severity tiers:
+- BLOCK: Defect causing incorrect behavior, data loss, security issue, or test failure.
+- WARN: Likely problem, 80%+ confident it matters, but not immediate failure.
+- NOTE: Observation worth mentioning. Low urgency.
+
+Every finding must cite file:line. Confidence threshold: 80%.
 """
 
 PROMPT_LAND = """\
-You are a landing agent. Two adversarial reviewers examined this codebase. \
+You are a landing agent. Two code reviewers examined this codebase. \
 Their findings are at {claude_review_path} and {codex_review_path}.
-Address every critical and major finding. Ignore minor findings.
+Address every BLOCK finding. Address WARN findings if straightforward. Ignore NOTEs.
 
 Rules:
-- Do not modify anything under .kisskorc/
+- Do not modify anything under .ark/
 - Do not merge branches. Do not run git merge. Commit on the current branch only.
 - Do not push to any remote.
 
@@ -157,16 +196,16 @@ Read the spec at {spec_path} for context.
 # Configuration
 # ---------------------------------------------------------------------------
 
-_MODEL_RAW = os.environ.get("KISSKORC_MODEL", "opus")
+_MODEL_RAW = os.environ.get("ARK_MODEL", "opus")
 _MODEL_VALIDATED = False
 MODEL = _MODEL_RAW
 MAX_LOOPS = 3
-KISSKORC_DIR = ".kisskorc"
+ARK_DIR = ".ark"
 
 
 def _validate_model():
     """Validate MODEL on first use. Deferred so 'help' and unknown commands work
-    even when KISSKORC_MODEL is invalid."""
+    even when ARK_MODEL is invalid."""
     global _MODEL_VALIDATED
     if _MODEL_VALIDATED:
         return
@@ -174,7 +213,7 @@ def _validate_model():
     # Only alphanumeric, hyphens, dots, and underscores allowed after that.
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]*", MODEL):
         print(
-            f"Error: KISSKORC_MODEL contains invalid characters: {MODEL!r}\n"
+            f"Error: ARK_MODEL contains invalid characters: {MODEL!r}\n"
             f"  Must start with a letter/digit. Only alphanumeric, hyphens, "
             f"dots, and underscores are allowed.",
             file=sys.stderr,
@@ -183,7 +222,7 @@ def _validate_model():
     _MODEL_VALIDATED = True
 
 # ---------------------------------------------------------------------------
-# Tmux helpers — kiss_korc runs in your terminal, tmux is the worker
+# Tmux helpers — ark runs in your terminal, tmux is the worker
 # ---------------------------------------------------------------------------
 
 
@@ -200,17 +239,14 @@ class Tmux:
             check=True,
         )
 
-    def send_command(self, cmd, sentinel_path=None):
+    def send_command(self, cmd):
         """Send a command string to the worker window via a temp script.
 
-        If sentinel_path is provided, the script writes it when done.
         This avoids tmux send-keys buffer limits on long commands.
         Uses mkstemp to avoid symlink attacks on predictable paths.
         """
-        fd, script_path = tempfile.mkstemp(prefix="korc-", suffix=".sh")
+        fd, script_path = tempfile.mkstemp(prefix="ark-", suffix=".sh")
         script_body = f"#!/bin/bash\n{cmd}\n"
-        if sentinel_path:
-            script_body += f"touch '{sentinel_path}'\n"
         try:
             os.write(fd, script_body.encode())
         finally:
@@ -264,13 +300,13 @@ class Tmux:
 
 
 def kp(project_dir, filename):
-    """Return absolute path inside .kisskorc/."""
-    return str(Path(project_dir) / KISSKORC_DIR / filename)
+    """Return absolute path inside .ark/."""
+    return str(Path(project_dir) / ARK_DIR / filename)
 
 
 def kf_exists(project_dir, filename):
-    """Check if a .kisskorc/ artifact exists and is non-empty."""
-    p = Path(project_dir) / KISSKORC_DIR / filename
+    """Check if a .ark/ artifact exists and is non-empty."""
+    p = Path(project_dir) / ARK_DIR / filename
     return p.exists() and p.stat().st_size > 0
 
 
@@ -288,14 +324,14 @@ def slugify(text):
 
 
 def ensure_dir(project_dir):
-    """Create .kisskorc/ directory."""
-    d = Path(project_dir) / KISSKORC_DIR
+    """Create .ark/ directory."""
+    d = Path(project_dir) / ARK_DIR
     d.mkdir(exist_ok=True)
     return d
 
 
 def create_branch(slug):
-    """Create and checkout a korc/ branch. Stashes if dirty."""
+    """Create and checkout an ark/ branch. Stashes if dirty."""
     # Check for dirty working tree
     status = subprocess.run(
         ["git", "status", "--porcelain"], capture_output=True, text=True,
@@ -303,10 +339,10 @@ def create_branch(slug):
     stashed = False
     if status.stdout.strip():
         print("  Stashing uncommitted changes...")
-        subprocess.run(["git", "stash", "push", "-m", f"korc-{slug}-autostash"], check=True)
+        subprocess.run(["git", "stash", "push", "-m", f"ark-{slug}-autostash"], check=True)
         stashed = True
 
-    branch = f"korc/{slug}"
+    branch = f"ark/{slug}"
     result = subprocess.run(
         ["git", "rev-parse", "--verify", branch], capture_output=True,
     )
@@ -325,27 +361,46 @@ def create_branch(slug):
                   file=sys.stderr)
 
 
-def run_in_tmux(
-        tmux, cmd, project_dir, timeout=1800):
-    """Send a command to the tmux worker and wait for it to finish.
+def make_sentinel(project_dir):
+    """Create a unique sentinel path for this invocation."""
+    return os.path.join(project_dir, ARK_DIR, f"_sentinel_{uuid.uuid4().hex[:8]}")
 
-    If the tmux session dies, recreates it and retries once.
+
+def run_in_tmux(
+        tmux, cmd, sentinel, timeout=1800):
+    """Send a command to the tmux worker and wait for the agent to signal done.
+
+    The agent is instructed (via PROMPT_SENTINEL in its prompt) to create the
+    sentinel file when finished. If the tmux session dies, recreates and retries.
     """
-    sentinel = os.path.join(project_dir, KISSKORC_DIR, f"_sentinel_{uuid.uuid4().hex[:8]}")
+    # sentinel is inside project_dir/.ark/ — go up two levels
+    project_dir = str(Path(sentinel).parent.parent)
     if not tmux.is_alive():
         tmux.create_session(project_dir)
-    tmux.send_command(cmd, sentinel_path=sentinel)
+    tmux.send_command(cmd)
     ok = tmux.wait_for_sentinel(sentinel, timeout=timeout)
+    if ok:
+        # Kill the interactive claude session so the pane is ready for the next step
+        subprocess.run(
+            ["tmux", "send-keys", "-t", tmux.session, "/exit", "Enter"],
+            capture_output=True,
+        )
+        time.sleep(2)
     if not ok and not tmux.is_alive():
         print("  [!] Retrying after tmux session loss", file=sys.stderr)
         tmux.create_session(project_dir)
-        sentinel = os.path.join(project_dir, KISSKORC_DIR, f"_sentinel_{uuid.uuid4().hex[:8]}")
-        tmux.send_command(cmd, sentinel_path=sentinel)
+        tmux.send_command(cmd)
         ok = tmux.wait_for_sentinel(sentinel, timeout=timeout)
+        if ok:
+            subprocess.run(
+                ["tmux", "send-keys", "-t", tmux.session, "/exit", "Enter"],
+                capture_output=True,
+            )
+            time.sleep(2)
     return ok
 
 
-SKIP_PERMISSIONS = os.environ.get("KISSKORC_SKIP_PERMISSIONS", "1") == "1"
+SKIP_PERMISSIONS = os.environ.get("ARK_SKIP_PERMISSIONS", "1") == "1"
 
 
 def claude_cmd(
@@ -376,7 +431,7 @@ def driver_cmd(
 
 def write_prompt(project_dir, step_name, content):
     """Write a prompt to a temp file, return its path."""
-    p = Path(project_dir) / KISSKORC_DIR / f"_prompt_{step_name}.md"
+    p = Path(project_dir) / ARK_DIR / f"_prompt_{step_name}.md"
     p.write_text(content)
     return str(p)
 
@@ -390,12 +445,13 @@ def step_spec(
         tmux, feature, project_dir):
     """Turn feature description into a spec."""
     print("[step:spec] Writing specification...")
+    sentinel = make_sentinel(project_dir)
     prompt = PROMPT_SPEC.format(
         feature_path=kp(project_dir, "FEATURE.md"),
         spec_path=kp(project_dir, "SPEC.md"),
-    )
+    ) + PROMPT_SENTINEL.format(sentinel_path=sentinel)
     pf = write_prompt(project_dir, "spec", prompt)
-    run_in_tmux(tmux, claude_cmd(pf), project_dir)
+    run_in_tmux(tmux, claude_cmd(pf), sentinel)
     ok = kf_exists(project_dir, "SPEC.md")
     print(f"  -> SPEC.md {'(written)' if ok else '(MISSING!)'}")
     return ok
@@ -405,12 +461,13 @@ def step_review_spec(
         tmux, project_dir):
     """Review the spec with fresh context."""
     print("[step:review-spec] Reviewing specification...")
+    sentinel = make_sentinel(project_dir)
     prompt = PROMPT_REVIEW_SPEC.format(
         spec_path=kp(project_dir, "SPEC.md"),
         review_path=kp(project_dir, "review-spec.md"),
-    )
+    ) + PROMPT_SENTINEL.format(sentinel_path=sentinel)
     pf = write_prompt(project_dir, "review-spec", prompt)
-    run_in_tmux(tmux, claude_cmd(pf), project_dir)
+    run_in_tmux(tmux, claude_cmd(pf), sentinel)
     print("  -> review-spec.md")
 
 
@@ -419,12 +476,13 @@ def step_encode(
     """Turn spec into a verification Makefile."""
     print("[step:encode] Writing verification Makefile...")
     mk_name = f"verify-{feature_slug}.mk"
+    sentinel = make_sentinel(project_dir)
     prompt = PROMPT_ENCODE.format(
         spec_path=kp(project_dir, "SPEC.md"),
         makefile_path=kp(project_dir, mk_name),
-    )
+    ) + PROMPT_SENTINEL.format(sentinel_path=sentinel)
     pf = write_prompt(project_dir, "encode", prompt)
-    run_in_tmux(tmux, claude_cmd(pf), project_dir)
+    run_in_tmux(tmux, claude_cmd(pf), sentinel)
     ok = kf_exists(project_dir, mk_name)
     print(f"  -> {mk_name} {'(written)' if ok else '(MISSING!)'}")
     return ok
@@ -434,13 +492,14 @@ def step_review_make(
         tmux, feature_slug, project_dir):
     """Review the Makefile with fresh context."""
     print("[step:review-make] Reviewing Makefile...")
+    sentinel = make_sentinel(project_dir)
     prompt = PROMPT_REVIEW_MAKE.format(
         spec_path=kp(project_dir, "SPEC.md"),
         makefile_path=kp(project_dir, f"verify-{feature_slug}.mk"),
         review_path=kp(project_dir, "review-make.md"),
-    )
+    ) + PROMPT_SENTINEL.format(sentinel_path=sentinel)
     pf = write_prompt(project_dir, "review-make", prompt)
-    run_in_tmux(tmux, claude_cmd(pf), project_dir)
+    run_in_tmux(tmux, claude_cmd(pf), sentinel)
     print("  -> review-make.md")
 
 
@@ -448,11 +507,12 @@ def step_implement(
         tmux, project_dir, driver="claude"):
     """Have an agent implement the spec."""
     print(f"[step:implement] Implementing (driver={driver})...")
+    sentinel = make_sentinel(project_dir)
     prompt = PROMPT_IMPLEMENT.format(
         spec_path=kp(project_dir, "SPEC.md"),
-    )
+    ) + PROMPT_SENTINEL.format(sentinel_path=sentinel)
     pf = write_prompt(project_dir, "implement", prompt)
-    run_in_tmux(tmux, driver_cmd(pf, project_dir, driver), project_dir)
+    run_in_tmux(tmux, driver_cmd(pf, project_dir, driver), sentinel)
     print("  -> implementation complete")
 
 
@@ -464,7 +524,7 @@ def step_verify(feature_slug, project_dir):
     The Makefile is no more dangerous than the implement step itself.
     """
     print("[step:verify] Running verification...")
-    mk_path = Path(project_dir) / KISSKORC_DIR / f"verify-{feature_slug}.mk"
+    mk_path = Path(project_dir) / ARK_DIR / f"verify-{feature_slug}.mk"
     if not mk_path.exists():
         print("  [!] Makefile not found, skipping verify")
         return False
@@ -474,7 +534,7 @@ def step_verify(feature_slug, project_dir):
         cwd=project_dir,
     )
     output = f"exit code: {result.returncode}\n\nstdout:\n{result.stdout}\n\nstderr:\n{result.stderr}"
-    review_path = Path(project_dir) / KISSKORC_DIR / "REVIEW.md"
+    review_path = Path(project_dir) / ARK_DIR / "REVIEW.md"
     review_path.write_text(output)
     passed = result.returncode == 0
     print(f"  -> {'PASS' if passed else 'FAIL'} (exit {result.returncode})")
@@ -489,12 +549,13 @@ def step_fix_make(
         tmux, feature_slug, project_dir):
     """Fix Makefile issues with fresh context."""
     print("[step:fix-make] Fixing Makefile...")
+    sentinel = make_sentinel(project_dir)
     prompt = PROMPT_FIX_MAKE.format(
         makefile_path=kp(project_dir, f"verify-{feature_slug}.mk"),
         review_path=kp(project_dir, "REVIEW.md"),
-    )
+    ) + PROMPT_SENTINEL.format(sentinel_path=sentinel)
     pf = write_prompt(project_dir, "fix-make", prompt)
-    run_in_tmux(tmux, claude_cmd(pf), project_dir)
+    run_in_tmux(tmux, claude_cmd(pf), sentinel)
     print(f"  -> verify-{feature_slug}.mk updated")
 
 
@@ -502,12 +563,13 @@ def step_reimplement(
         tmux, project_dir, driver="claude"):
     """Reimplement with spec + review context."""
     print(f"[step:reimplement] Re-implementing (driver={driver})...")
+    sentinel = make_sentinel(project_dir)
     prompt = PROMPT_REIMPLEMENT.format(
         spec_path=kp(project_dir, "SPEC.md"),
         review_path=kp(project_dir, "REVIEW.md"),
-    )
+    ) + PROMPT_SENTINEL.format(sentinel_path=sentinel)
     pf = write_prompt(project_dir, "reimplement", prompt)
-    run_in_tmux(tmux, driver_cmd(pf, project_dir, driver), project_dir)
+    run_in_tmux(tmux, driver_cmd(pf, project_dir, driver), sentinel)
     print("  -> re-implementation complete")
 
 
@@ -517,33 +579,38 @@ def step_adversarial(
     print("[step:adversarial] Adversarial review...")
 
     # Claude review
+    sentinel = make_sentinel(project_dir)
     claude_prompt = PROMPT_ADVERSARIAL.format(
         spec_path=kp(project_dir, "SPEC.md"),
         output_path=kp(project_dir, "adversarial-claude.md"),
-    )
+    ) + PROMPT_SENTINEL.format(sentinel_path=sentinel)
     pf = write_prompt(project_dir, "adversarial-claude", claude_prompt)
-    run_in_tmux(tmux, claude_cmd(pf), project_dir)
+    run_in_tmux(tmux, claude_cmd(pf), sentinel)
     print("  -> adversarial-claude.md")
 
-    # Codex review
+    # Codex review (codex exits on its own, so use bash touch for sentinel)
+    sentinel = make_sentinel(project_dir)
     codex_prompt = PROMPT_ADVERSARIAL.format(
         spec_path=kp(project_dir, "SPEC.md"),
         output_path=kp(project_dir, "adversarial-codex.md"),
     )
     pf = write_prompt(project_dir, "adversarial-codex", codex_prompt)
-    # Read prompt into a variable; double-quoted "$prompt" is safe against
-    # word splitting and globbing. Paths are shlex-quoted.
-    codex_cmd_str = f"prompt=$(<{shlex.quote(pf)}) && codex exec --full-auto -C {shlex.quote(project_dir)} \"$prompt\""
-    run_in_tmux(tmux, codex_cmd_str, project_dir)
+    codex_cmd_str = (
+        f"prompt=$(<{shlex.quote(pf)}) && "
+        f"codex exec --full-auto -C {shlex.quote(project_dir)} \"$prompt\" ; "
+        f"touch {shlex.quote(sentinel)}"
+    )
+    run_in_tmux(tmux, codex_cmd_str, sentinel)
     print("  -> adversarial-codex.md")
 
-    # Check for critical/major findings or missing review files (agent failure)
+    # Check for BLOCK/WARN findings or missing review files (agent failure)
     for name in ["adversarial-claude.md", "adversarial-codex.md"]:
-        p = Path(project_dir) / KISSKORC_DIR / name
+        p = Path(project_dir) / ARK_DIR / name
         if not p.exists():
             print(f"  [!] {name} missing — treating as findings present", file=sys.stderr)
             return True
-        if any(w in p.read_text().lower() for w in ["critical", "major"]):
+        content = p.read_text()
+        if "BLOCK:" in content or "WARN:" in content:
             return True
     return False
 
@@ -552,13 +619,14 @@ def step_land(
         tmux, project_dir):
     """Fresh agent addresses adversarial findings. Interactive."""
     print("[step:land] Addressing adversarial findings...")
+    sentinel = make_sentinel(project_dir)
     prompt = PROMPT_LAND.format(
         spec_path=kp(project_dir, "SPEC.md"),
         claude_review_path=kp(project_dir, "adversarial-claude.md"),
         codex_review_path=kp(project_dir, "adversarial-codex.md"),
-    )
+    ) + PROMPT_SENTINEL.format(sentinel_path=sentinel)
     pf = write_prompt(project_dir, "land", prompt)
-    run_in_tmux(tmux, claude_cmd(pf), project_dir)
+    run_in_tmux(tmux, claude_cmd(pf), sentinel)
     print("  -> landing complete")
 
 
@@ -593,10 +661,10 @@ def detect_resume_point(feature_slug, project_dir):
 
 
 def archive_run(project_dir, label=None):
-    """Copy .kisskorc/ artifacts to .kisskorc/archive/<timestamp>/."""
-    korc_dir = Path(project_dir) / KISSKORC_DIR
+    """Move .ark/ artifacts to ~/.ark/archive/<timestamp>/."""
+    korc_dir = Path(project_dir) / ARK_DIR
     if not korc_dir.exists():
-        print("Nothing to archive — no .kisskorc/ directory", file=sys.stderr)
+        print("Nothing to archive — no .ark/ directory", file=sys.stderr)
         return
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -605,13 +673,11 @@ def archive_run(project_dir, label=None):
     else:
         archive_name = ts
 
-    archive_dir = korc_dir / "archive" / archive_name
+    archive_dir = Path.home() / ".ark" / "archive" / archive_name
     archive_dir.mkdir(parents=True, exist_ok=True)
 
-    # Move all non-archive, non-prompt artifacts
+    # Move all artifacts out of .ark/
     for f in korc_dir.iterdir():
-        if f.name == "archive" or f.name.startswith("_prompt_"):
-            continue
         if f.is_file():
             shutil.move(str(f), str(archive_dir / f.name))
 
@@ -625,36 +691,36 @@ def archive_run(project_dir, label=None):
 
 
 def run_pipeline(feature, project_dir, driver="claude"):
-    """Execute the full kiss_korc pipeline."""
-    if os.environ.get("KISSKORC_RUNNING"):
-        print("Error: recursive kiss-korc invocation blocked", file=sys.stderr)
+    """Execute the full ark pipeline."""
+    if os.environ.get("ARK_RUNNING"):
+        print("Error: recursive ark invocation blocked", file=sys.stderr)
         sys.exit(1)
-    os.environ["KISSKORC_RUNNING"] = "1"
+    os.environ["ARK_RUNNING"] = "1"
 
     project_dir = os.path.abspath(project_dir)
     korc_dir = ensure_dir(project_dir)
     feature_slug = slugify(feature)
-    session_name = f"korc-{feature_slug}"
+    session_name = f"ark-{feature_slug}"
 
-    print(f"kiss_korc: {feature_slug}")
+    print(f"ark: {feature_slug}")
     print(f"  project: {project_dir}")
     print(f"  artifacts: {korc_dir}")
     print(f"  tmux: {session_name}")
     print(f"  driver: {driver}")
     if SKIP_PERMISSIONS:
         print("  WARNING: agents run with --dangerously-skip-permissions")
-        print("           set KISSKORC_SKIP_PERMISSIONS=0 to disable")
+        print("           set ARK_SKIP_PERMISSIONS=0 to disable")
     print()
 
     # Save driver choice for resume
-    driver_file = Path(project_dir) / KISSKORC_DIR / "DRIVER"
+    driver_file = Path(project_dir) / ARK_DIR / "DRIVER"
     if not driver_file.exists():
         driver_file.write_text(driver)
     else:
         driver = driver_file.read_text().strip()
 
     # Save feature description
-    feature_file = Path(project_dir) / KISSKORC_DIR / "FEATURE.md"
+    feature_file = Path(project_dir) / ARK_DIR / "FEATURE.md"
     if not feature_file.exists():
         feature_file.write_text(feature)
 
@@ -718,14 +784,14 @@ def run_pipeline(feature, project_dir, driver="claude"):
     # Phase 4: Adversarial review
     has_findings = step_adversarial(tmux, project_dir)
 
-    # Phase 5: Land — address critical/major findings
+    # Phase 5: Land — address BLOCK/WARN findings
     if has_findings:
         step_land(tmux, project_dir)
 
     # Archive results
     archive_run(project_dir, feature_slug)
 
-    print(f"\n  Done. Branch korc/{feature_slug} is ready to merge.")
+    print(f"\n  Done. Branch ark/{feature_slug} is ready to merge.")
     return 0
 
 
@@ -737,13 +803,14 @@ def run_pipeline(feature, project_dir, driver="claude"):
 def print_help(file=sys.stdout):
     """Print the help message to the given file object."""
     msg = """\
-kiss-korc — a dumb Python orchestrator for LLM agents.
+ark — a dumb Python orchestrator for LLM agents.
 
 Usage:
-  kiss-korc new 'Add auth' [--driver claude|codex]
-  echo 'Add auth' | kiss-korc new [--driver claude|codex]
-  kiss-korc archive [label]
-  kiss-korc help"""
+  ark new 'Add auth' [--driver claude|codex]
+  echo 'Add auth' | ark new [--driver claude|codex]
+  ark continue
+  ark archive [label]
+  ark help"""
     print(msg, file=file)
 
 
@@ -762,6 +829,17 @@ def main():
         label = sys.argv[2] if len(sys.argv) > 2 else None
         archive_run(os.getcwd(), label)
         return
+
+    if cmd == "continue":
+        project_dir = os.getcwd()
+        feature_file = Path(project_dir) / ARK_DIR / "FEATURE.md"
+        if not feature_file.exists():
+            print("Error: no .ark/FEATURE.md — nothing to continue", file=sys.stderr)
+            sys.exit(1)
+        feature = feature_file.read_text().strip()
+        driver_file = Path(project_dir) / ARK_DIR / "DRIVER"
+        driver = driver_file.read_text().strip() if driver_file.exists() else "claude"
+        sys.exit(run_pipeline(feature, project_dir, driver=driver))
 
     if cmd == "new":
         # Parse --driver flag and optional positional argument
@@ -794,8 +872,8 @@ def main():
             feature = positional[0]
         elif sys.stdin.isatty():
             print("Error: pipe a feature description to stdin or pass it as an argument", file=sys.stderr)
-            print("  kiss-korc new 'Add auth'", file=sys.stderr)
-            print("  echo 'Add auth' | kiss-korc new", file=sys.stderr)
+            print("  ark new 'Add auth'", file=sys.stderr)
+            print("  echo 'Add auth' | ark new", file=sys.stderr)
             sys.exit(1)
         else:
             feature = sys.stdin.read().strip()

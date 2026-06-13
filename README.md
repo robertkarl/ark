@@ -1,13 +1,13 @@
-# kiss-korc
+# ark
 
 A dumb Python orchestrator for LLM agents. No LLM in the orchestration loop.
 
-The problem: when you tell an LLM "you're the orchestrator, have subagents plan, review, implement" — it inevitably tries to write code, negotiate, or go off-script. kiss-korc solves this by making the orchestrator a plain Python script that runs a fixed pipeline.
+The problem: when you tell an LLM "you're the orchestrator, have subagents plan, review, implement" — it inevitably tries to write code, negotiate, or go off-script. ark solves this by making the orchestrator a plain Python script that runs a fixed pipeline.
 
 ## Install
 
 ```
-ln -sf $(pwd)/kiss_korc.py ~/bin/kiss-korc
+ln -sf $(pwd)/ark.py ~/bin/ark
 ```
 
 Requires: `python3`, `tmux`, `claude` (Claude Code CLI), `codex` (optional, for adversarial review and `--driver codex`).
@@ -15,22 +15,22 @@ Requires: `python3`, `tmux`, `claude` (Claude Code CLI), `codex` (optional, for 
 ## Usage
 
 ```
-echo 'Add a health check endpoint' | kiss-korc new
-echo 'Add a health check endpoint' | kiss-korc new --driver codex
-echo 'What does this project do?' | kiss-korc ask
-kiss-korc archive my-label
-kiss-korc help
+echo 'Add a health check endpoint' | ark new
+echo 'Add a health check endpoint' | ark new --driver codex
+echo 'What does this project do?' | ark ask
+ark archive my-label
+ark help
 ```
 
 ## Pipeline
 
 ```
-cat feature.txt | kiss-korc new
+cat feature.txt | ark new
 ```
 
-1. **spec** — agent explores codebase, writes `.kisskorc/SPEC.md` with numbered acceptance criteria
+1. **spec** — agent explores codebase, writes `.ark/SPEC.md` with numbered acceptance criteria
 2. **review-spec** — fresh agent reviews spec for ambiguity, missing edge cases
-3. **encode** — fresh agent writes a verification Makefile (`.kisskorc/verify-*.mk`)
+3. **encode** — fresh agent writes a verification Makefile (`.ark/verify-*.mk`)
 4. **review-make** — fresh agent reviews Makefile for impossible/vacuous checks
 5. **implement** — agent implements the spec (up to 3 attempts)
 6. **verify** — runs `make -k` on the Makefile, writes `REVIEW.md`
@@ -44,18 +44,18 @@ Each agent gets fresh context. No state bleeds between steps. The Python script 
 
 ## How it works
 
-- All agents run in a tmux session you can attach to: `tmux attach -t korc-*`
-- Creates a `korc/<slug>` git branch for isolation
+- All agents run in a tmux session you can attach to: `tmux attach -t ark-*`
+- Creates an `ark/<slug>` git branch for isolation
 - Agents commit as they go on the feature branch
 - Resumable: re-run the same command and it skips completed steps
-- Archives results to `.kisskorc/archive/` after each run
+- Archives results to `.ark/archive/` after each run
 
 ## Configuration
 
 | Env var | Default | Description |
 |---------|---------|-------------|
-| `KISSKORC_MODEL` | `opus` | Model for all claude invocations |
-| `KISSKORC_SKIP_PERMISSIONS` | `1` | Set to `0` to remove `--dangerously-skip-permissions` |
+| `ARK_MODEL` | `opus` | Model for all claude invocations |
+| `ARK_SKIP_PERMISSIONS` | `1` | Set to `0` to remove `--dangerously-skip-permissions` |
 
 ## Design principles
 
