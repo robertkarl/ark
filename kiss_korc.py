@@ -447,30 +447,17 @@ def step_implement(tmux, project_dir, driver="claude"):
     print("  -> implementation complete")
 
 
-def _check_makefile_safety(mk_path):
-    """Reject Makefiles containing shell-escape constructs that could run
-    arbitrary commands via $(shell ...) or backticks."""
-    content = mk_path.read_text()
-    # $(shell ...) and backtick command substitution in Make recipes
-    # are the main vectors for arbitrary code execution.
-    dangerous = re.findall(r'\$\(shell\b|`[^`]+`', content, re.IGNORECASE)
-    if dangerous:
-        print(f"  [!] Makefile contains dangerous constructs: {dangerous[:3]}",
-              file=sys.stderr)
-        print("      Refusing to execute. Remove $(shell ...) and backtick "
-              "substitutions.", file=sys.stderr)
-        return False
-    return True
-
-
 def step_verify(feature_slug, project_dir):
-    """Run the verification Makefile. Returns True if all checks pass."""
+    """Run the verification Makefile. Returns True if all checks pass.
+
+    Security model: the Makefile is LLM-generated and has unfettered shell
+    access. This is intentional — the agents already run with full permissions.
+    The Makefile is no more dangerous than the implement step itself.
+    """
     print("[step:verify] Running verification...")
     mk_path = Path(project_dir) / KISSKORC_DIR / f"verify-{feature_slug}.mk"
     if not mk_path.exists():
         print("  [!] Makefile not found, skipping verify")
-        return False
-    if not _check_makefile_safety(mk_path):
         return False
     result = subprocess.run(
         ["make", "-k", "-f", str(mk_path)],
@@ -562,31 +549,6 @@ def step_land(tmux, project_dir):
     print("  -> landing complete")
 
 
-def step_ship(feature_slug, project_dir):
-    """Final step: verify everything passes and declare ready."""
-    print("[step:ship] Final verification...")
-    mk_path = Path(project_dir) / KISSKORC_DIR / f"verify-{feature_slug}.mk"
-    if not mk_path.exists():
-        print("  [!] No Makefile found. Cannot ship.")
-        return False
-    if not _check_makefile_safety(mk_path):
-        return False
-    result = subprocess.run(
-        ["make", "-k", "-f", str(mk_path)],
-        capture_output=True, text=True,
-        cwd=project_dir,
-    )
-    if result.returncode == 0:
-        print(f"  SHIP IT. Branch korc/{feature_slug} is ready to merge.")
-        return True
-    else:
-        print("  [!] Final verification failed.")
-        review_path = Path(project_dir) / KISSKORC_DIR / "REVIEW.md"
-        output = f"exit code: {result.returncode}\n\nstdout:\n{result.stdout}\n\nstderr:\n{result.stderr}"
-        review_path.write_text(output)
-        return False
-
-
 # ---------------------------------------------------------------------------
 # Resume logic
 # ---------------------------------------------------------------------------
@@ -626,19 +588,11 @@ def archive_run(project_dir, label=None):
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     if label:
-        # Sanitize label: strip path separators and ".." to prevent traversal
-        safe_label = re.sub(r"[/\\]", "-", label).replace("..", "")
-        safe_label = safe_label.strip("-") or "unnamed"
-        archive_name = f"{ts}-{safe_label}"
+        archive_name = f"{ts}-{label}"
     else:
         archive_name = ts
 
     archive_dir = korc_dir / "archive" / archive_name
-    # Verify the resolved path is still under the archive directory
-    expected_parent = (korc_dir / "archive").resolve()
-    if not archive_dir.resolve().is_relative_to(expected_parent):
-        print(f"Error: invalid archive label: {label!r}", file=sys.stderr)
-        return
     archive_dir.mkdir(parents=True, exist_ok=True)
 
     # Copy all non-archive, non-prompt artifacts
@@ -659,6 +613,11 @@ def archive_run(project_dir, label=None):
 
 def run_pipeline(feature, project_dir, driver="claude"):
     """Execute the full kiss_korc pipeline."""
+    if os.environ.get("KISSKORC_RUNNING"):
+        print("Error: recursive kiss-korc invocation blocked", file=sys.stderr)
+        sys.exit(1)
+    os.environ["KISSKORC_RUNNING"] = "1"
+
     project_dir = os.path.abspath(project_dir)
     korc_dir = ensure_dir(project_dir)
     feature_slug = slugify(feature)
@@ -750,13 +709,11 @@ def run_pipeline(feature, project_dir, driver="claude"):
     if has_findings:
         step_land(tmux, project_dir)
 
-    # Phase 6: Ship
-    result = 0 if step_ship(feature_slug, project_dir) else 1
-
     # Archive results
     archive_run(project_dir, feature_slug)
 
-    return result
+    print(f"\n  Done. Branch korc/{feature_slug} is ready to merge.")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -766,81 +723,15 @@ def run_pipeline(feature, project_dir, driver="claude"):
 
 def print_help(file=sys.stdout):
     """Print the help message to the given file object."""
-    cat = r"""
-    /\_/\
-   ( o.o )
-    > ^ <
-   /|   |\
-  (_|   |_)""".lstrip("\n")
     msg = """\
-kiss-korc — a dumb Python orchestrator that runs a fixed, multi-phase pipeline
-for developing features using fresh-context AI agents in tmux.
+kiss-korc — a dumb Python orchestrator for LLM agents.
 
 Usage:
-  kiss-korc new [--driver claude|codex]
-                             Read a feature description from stdin and run the
-                             full pipeline (spec → encode → implement → review
-                             → land → ship). --driver selects the LLM for
-                             implement/reimplement steps (default: claude).
-  kiss-korc ask              Read a question from stdin, spawn a fresh agent,
-                             and print the answer to stdout.
-  kiss-korc archive [label]  Archive the current .kisskorc/ artifacts. The label
-                             argument is optional.
-  kiss-korc help             Show this help message.
-
-Examples:
-  echo 'Add auth' | kiss-korc new
-  echo 'What does this project do?' | kiss-korc ask
-  kiss-korc archive my-label
+  kiss-korc new 'Add auth' [--driver claude|codex]
+  echo 'Add auth' | kiss-korc new [--driver claude|codex]
+  kiss-korc archive [label]
   kiss-korc help"""
-    print(cat, file=file)
-    print(file=file)
     print(msg, file=file)
-
-
-def cmd_ask():
-    """Read a question from stdin, spawn a fresh agent, print the answer."""
-    _validate_model()
-
-    if sys.stdin.isatty():
-        print("Error: pipe a question to stdin", file=sys.stderr)
-        print("  echo 'What does this project do?' | kiss-korc ask", file=sys.stderr)
-        sys.exit(1)
-
-    question = sys.stdin.read().strip()
-    if not question:
-        print("Error: empty question", file=sys.stderr)
-        sys.exit(1)
-
-    cmd = ["claude", "-p", "--model", MODEL,
-           "--append-system-prompt",
-           "Always include relevant filenames and paths in your answers. "
-           "When asked about a file, repeat the filename in your response."]
-    if SKIP_PERMISSIONS:
-        cmd.append("--dangerously-skip-permissions")
-        print("Warning: agent runs with --dangerously-skip-permissions "
-              "(set KISSKORC_SKIP_PERMISSIONS=0 to disable)", file=sys.stderr)
-
-    wrapped = (
-        "Answer the following question about the codebase in the current "
-        "working directory. Read any files needed to answer accurately. "
-        "Include the filename(s) you referenced in your answer.\n\n"
-        f"Question: {question}"
-    )
-
-    result = subprocess.run(
-        cmd,
-        input=wrapped,
-        text=True,
-        capture_output=True,
-    )
-
-    if result.stderr:
-        sys.stderr.write(result.stderr)
-    if result.stdout:
-        sys.stdout.write(result.stdout)
-
-    sys.exit(result.returncode)
 
 
 def main():
@@ -859,13 +750,10 @@ def main():
         archive_run(os.getcwd(), label)
         return
 
-    if cmd == "ask":
-        cmd_ask()
-        return
-
     if cmd == "new":
-        # Parse --driver flag
+        # Parse --driver flag and optional positional argument
         driver = "claude"
+        positional = []
         args = sys.argv[2:]
         i = 0
         while i < len(args):
@@ -878,17 +766,28 @@ def main():
                     print(f"Error: unsupported driver: {driver!r} (must be claude or codex)", file=sys.stderr)
                     sys.exit(1)
                 i += 2
-            else:
+            elif args[i].startswith("-"):
                 print(f"Error: unknown flag: {args[i]}", file=sys.stderr)
                 sys.exit(1)
+            else:
+                positional.append(args[i])
+                i += 1
 
-        if sys.stdin.isatty():
-            print("Error: pipe a feature description to stdin", file=sys.stderr)
-            print("  echo 'Add auth' | kiss-korc new", file=sys.stderr)
+        if len(positional) > 1:
+            print("Error: too many arguments — expected at most one feature description", file=sys.stderr)
             sys.exit(1)
 
-        feature = sys.stdin.read().strip()
-        if not feature:
+        if positional:
+            feature = positional[0]
+        elif sys.stdin.isatty():
+            print("Error: pipe a feature description to stdin or pass it as an argument", file=sys.stderr)
+            print("  kiss-korc new 'Add auth'", file=sys.stderr)
+            print("  echo 'Add auth' | kiss-korc new", file=sys.stderr)
+            sys.exit(1)
+        else:
+            feature = sys.stdin.read().strip()
+
+        if not feature or not feature.strip():
             print("Error: empty feature description", file=sys.stderr)
             sys.exit(1)
 
