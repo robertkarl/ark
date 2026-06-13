@@ -608,12 +608,12 @@ def archive_run(project_dir, label=None):
     archive_dir = korc_dir / "archive" / archive_name
     archive_dir.mkdir(parents=True, exist_ok=True)
 
-    # Copy all non-archive, non-prompt artifacts
+    # Move all non-archive, non-prompt artifacts
     for f in korc_dir.iterdir():
         if f.name == "archive" or f.name.startswith("_prompt_"):
             continue
         if f.is_file():
-            shutil.copy2(f, archive_dir / f.name)
+            shutil.move(str(f), str(archive_dir / f.name))
 
     print(f"  Archived to {archive_dir}")
     return archive_dir
