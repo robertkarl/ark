@@ -136,7 +136,9 @@ You are a fresh-context code reviewer. You have ZERO knowledge of the build \
 process. You review only the diff and the codebase as it exists right now.
 
 Step 1: Gather the diff.
-Run: git diff main...HEAD
+First, determine the default branch: check if `main` exists with \
+`git rev-parse --verify main`, and if not, fall back to `master`.
+Then run: git diff <default-branch>...HEAD
 If the diff is empty, write "Nothing to review" to {output_path} and stop.
 
 Step 2: Read context.
@@ -660,10 +662,19 @@ def detect_resume_point(feature_slug, project_dir):
 # ---------------------------------------------------------------------------
 
 
+def migrate_kisskorc(project_dir):
+    """Migrate .kisskorc/ artifacts to .ark/ if needed."""
+    old_dir = Path(project_dir) / ".kisskorc"
+    new_dir = Path(project_dir) / ARK_DIR
+    if old_dir.exists() and not new_dir.exists():
+        print("  Migrating .kisskorc/ -> .ark/...")
+        shutil.copytree(str(old_dir), str(new_dir))
+
+
 def archive_run(project_dir, label=None):
-    """Move .ark/ artifacts to ~/.ark/archive/<timestamp>/."""
-    korc_dir = Path(project_dir) / ARK_DIR
-    if not korc_dir.exists():
+    """Move .ark/ artifacts to .ark/archive/<timestamp>/."""
+    ark_dir = Path(project_dir) / ARK_DIR
+    if not ark_dir.exists():
         print("Nothing to archive — no .ark/ directory", file=sys.stderr)
         return
 
@@ -673,11 +684,13 @@ def archive_run(project_dir, label=None):
     else:
         archive_name = ts
 
-    archive_dir = Path.home() / ".ark" / "archive" / archive_name
+    archive_dir = ark_dir / "archive" / archive_name
     archive_dir.mkdir(parents=True, exist_ok=True)
 
-    # Move all artifacts out of .ark/
-    for f in korc_dir.iterdir():
+    # Move all artifacts out of .ark/ (skip the archive directory itself)
+    for f in ark_dir.iterdir():
+        if f.name == "archive":
+            continue
         if f.is_file():
             shutil.move(str(f), str(archive_dir / f.name))
 
@@ -832,6 +845,7 @@ def main():
 
     if cmd == "continue":
         project_dir = os.getcwd()
+        migrate_kisskorc(project_dir)
         feature_file = Path(project_dir) / ARK_DIR / "FEATURE.md"
         if not feature_file.exists():
             print("Error: no .ark/FEATURE.md — nothing to continue", file=sys.stderr)
