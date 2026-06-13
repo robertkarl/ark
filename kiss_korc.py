@@ -340,6 +340,18 @@ def claude_cmd(prompt_file):
     return f'claude -p --model {shlex.quote(MODEL)}{skip} < {shlex.quote(prompt_file)}'
 
 
+def codex_cmd(prompt_file, project_dir):
+    """Build a codex exec command that reads its prompt from a file."""
+    return f'prompt=$(<{shlex.quote(prompt_file)}) && codex exec --full-auto -C {shlex.quote(project_dir)} "$prompt"'
+
+
+def driver_cmd(prompt_file, project_dir, driver="claude"):
+    """Build the right agent command based on the driver."""
+    if driver == "codex":
+        return codex_cmd(prompt_file, project_dir)
+    return claude_cmd(prompt_file)
+
+
 def write_prompt(project_dir, step_name, content):
     """Write a prompt to a temp file, return its path."""
     p = Path(project_dir) / KISSKORC_DIR / f"_prompt_{step_name}.md"
@@ -406,14 +418,14 @@ def step_review_make(tmux, feature_slug, project_dir):
     print("  -> review-make.md")
 
 
-def step_implement(tmux, project_dir):
-    """Have an agent implement the spec. Interactive — user can intervene."""
-    print("[step:implement] Implementing (interactive)...")
+def step_implement(tmux, project_dir, driver="claude"):
+    """Have an agent implement the spec."""
+    print(f"[step:implement] Implementing (driver={driver})...")
     prompt = PROMPT_IMPLEMENT.format(
         spec_path=kp(project_dir, "SPEC.md"),
     )
     pf = write_prompt(project_dir, "implement", prompt)
-    run_in_tmux(tmux, claude_cmd(pf), project_dir)
+    run_in_tmux(tmux, driver_cmd(pf, project_dir, driver), project_dir)
     print("  -> implementation complete")
 
 
@@ -471,15 +483,15 @@ def step_fix_make(tmux, feature_slug, project_dir):
     print(f"  -> verify-{feature_slug}.mk updated")
 
 
-def step_reimplement(tmux, project_dir):
-    """Reimplement with spec + review context. Interactive."""
-    print("[step:reimplement] Re-implementing (interactive)...")
+def step_reimplement(tmux, project_dir, driver="claude"):
+    """Reimplement with spec + review context."""
+    print(f"[step:reimplement] Re-implementing (driver={driver})...")
     prompt = PROMPT_REIMPLEMENT.format(
         spec_path=kp(project_dir, "SPEC.md"),
         review_path=kp(project_dir, "REVIEW.md"),
     )
     pf = write_prompt(project_dir, "reimplement", prompt)
-    run_in_tmux(tmux, claude_cmd(pf), project_dir)
+    run_in_tmux(tmux, driver_cmd(pf, project_dir, driver), project_dir)
     print("  -> re-implementation complete")
 
 
@@ -627,7 +639,7 @@ def archive_run(project_dir, label=None):
 # ---------------------------------------------------------------------------
 
 
-def run_pipeline(feature, project_dir):
+def run_pipeline(feature, project_dir, driver="claude"):
     """Execute the full kiss_korc pipeline."""
     project_dir = os.path.abspath(project_dir)
     korc_dir = ensure_dir(project_dir)
@@ -638,10 +650,18 @@ def run_pipeline(feature, project_dir):
     print(f"  project: {project_dir}")
     print(f"  artifacts: {korc_dir}")
     print(f"  tmux: {session_name}")
+    print(f"  driver: {driver}")
     if SKIP_PERMISSIONS:
         print("  WARNING: agents run with --dangerously-skip-permissions")
         print("           set KISSKORC_SKIP_PERMISSIONS=0 to disable")
     print()
+
+    # Save driver choice for resume
+    driver_file = Path(project_dir) / KISSKORC_DIR / "DRIVER"
+    if not driver_file.exists():
+        driver_file.write_text(driver)
+    else:
+        driver = driver_file.read_text().strip()
 
     # Save feature description
     feature_file = Path(project_dir) / KISSKORC_DIR / "FEATURE.md"
@@ -689,9 +709,9 @@ def run_pipeline(feature, project_dir):
         print(f"\n--- Attempt {attempt}/{MAX_LOOPS} ---\n")
 
         if attempt == 1:
-            step_implement(tmux, project_dir)
+            step_implement(tmux, project_dir, driver)
         else:
-            step_reimplement(tmux, project_dir)
+            step_reimplement(tmux, project_dir, driver)
 
         passed = step_verify(feature_slug, project_dir)
         if passed:
@@ -739,9 +759,11 @@ kiss-korc — a dumb Python orchestrator that runs a fixed, multi-phase pipeline
 for developing features using fresh-context AI agents in tmux.
 
 Usage:
-  kiss-korc new              Read a feature description from stdin and run the
+  kiss-korc new [--driver claude|codex]
+                             Read a feature description from stdin and run the
                              full pipeline (spec → encode → implement → review
-                             → land → ship).
+                             → land → ship). --driver selects the LLM for
+                             implement/reimplement steps (default: claude).
   kiss-korc ask              Read a question from stdin, spawn a fresh agent,
                              and print the answer to stdout.
   kiss-korc archive [label]  Archive the current .kisskorc/ artifacts. The label
@@ -824,6 +846,24 @@ def main():
         return
 
     if cmd == "new":
+        # Parse --driver flag
+        driver = "claude"
+        args = sys.argv[2:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--driver":
+                if i + 1 >= len(args):
+                    print("Error: --driver requires a value (claude or codex)", file=sys.stderr)
+                    sys.exit(1)
+                driver = args[i + 1]
+                if driver not in ("claude", "codex"):
+                    print(f"Error: unsupported driver: {driver!r} (must be claude or codex)", file=sys.stderr)
+                    sys.exit(1)
+                i += 2
+            else:
+                print(f"Error: unknown flag: {args[i]}", file=sys.stderr)
+                sys.exit(1)
+
         if sys.stdin.isatty():
             print("Error: pipe a feature description to stdin", file=sys.stderr)
             print("  echo 'Add auth' | kiss-korc new", file=sys.stderr)
@@ -835,7 +875,7 @@ def main():
             sys.exit(1)
 
         project_dir = os.getcwd()
-        sys.exit(run_pipeline(feature, project_dir))
+        sys.exit(run_pipeline(feature, project_dir, driver=driver))
 
     print(f"Unknown command: {cmd}", file=sys.stderr)
     sys.exit(1)
