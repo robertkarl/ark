@@ -12,16 +12,22 @@ Usage:
 # TODO: add the option for korc to spin up agents when it wants/needs
 # some judgement (like, "is this work good enough?")
 
+import functools
 import hashlib
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
+
+# Force unbuffered output so pipeline progress shows in real time
+print = functools.partial(print, flush=True)
 
 # ---------------------------------------------------------------------------
 # Prompts — each agent gets only what it needs, nothing more.
@@ -147,18 +153,29 @@ Read the spec at {spec_path} for context.
 # ---------------------------------------------------------------------------
 
 _MODEL_RAW = os.environ.get("KISSKORC_MODEL", "opus")
-# Validate model name: only alphanumeric, hyphens, dots, and underscores allowed.
-# This prevents shell injection via crafted KISSKORC_MODEL values.
-if not re.fullmatch(r"[a-zA-Z0-9._-]+", _MODEL_RAW):
-    print(
-        f"Error: KISSKORC_MODEL contains invalid characters: {_MODEL_RAW!r}\n"
-        f"  Only alphanumeric characters, hyphens, dots, and underscores are allowed.",
-        file=sys.stderr,
-    )
-    sys.exit(1)
+_MODEL_VALIDATED = False
 MODEL = _MODEL_RAW
 MAX_LOOPS = 3
 KISSKORC_DIR = ".kisskorc"
+
+
+def _validate_model():
+    """Validate MODEL on first use. Deferred so 'help' and unknown commands work
+    even when KISSKORC_MODEL is invalid."""
+    global _MODEL_VALIDATED
+    if _MODEL_VALIDATED:
+        return
+    # Must start with alphanumeric to prevent flag injection (e.g. --help).
+    # Only alphanumeric, hyphens, dots, and underscores allowed after that.
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]*", MODEL):
+        print(
+            f"Error: KISSKORC_MODEL contains invalid characters: {MODEL!r}\n"
+            f"  Must start with a letter/digit. Only alphanumeric, hyphens, "
+            f"dots, and underscores are allowed.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    _MODEL_VALIDATED = True
 
 # ---------------------------------------------------------------------------
 # Tmux helpers — kiss_korc runs in your terminal, tmux is the worker
@@ -188,7 +205,7 @@ class Tmux:
         fd, script_path = tempfile.mkstemp(prefix="korc-", suffix=".sh")
         script_body = f"#!/bin/bash\n{cmd}\n"
         if sentinel_path:
-            script_body += f"touch {sentinel_path}\n"
+            script_body += f"touch '{sentinel_path}'\n"
         try:
             os.write(fd, script_body.encode())
         finally:
@@ -302,10 +319,9 @@ def create_branch(slug):
 
 def run_in_tmux(tmux, cmd, project_dir, timeout=1800):
     """Send a command to the tmux worker and wait for it to finish."""
-    sentinel = os.path.join(project_dir, KISSKORC_DIR, "_sentinel")
-    # Remove stale sentinel
-    if os.path.exists(sentinel):
-        os.unlink(sentinel)
+    # Use a unique sentinel per invocation to avoid TOCTOU races with
+    # concurrent pipeline runs on the same project.
+    sentinel = os.path.join(project_dir, KISSKORC_DIR, f"_sentinel_{uuid.uuid4().hex[:8]}")
     tmux.send_command(cmd, sentinel_path=sentinel)
     return tmux.wait_for_sentinel(sentinel, timeout=timeout)
 
@@ -319,8 +335,9 @@ def claude_cmd(prompt_file):
     Uses stdin redirection (< file) instead of $(cat file) inside double quotes
     to prevent shell interpretation of prompt file contents.
     """
+    _validate_model()
     skip = " --dangerously-skip-permissions" if SKIP_PERMISSIONS else ""
-    return f'claude -p --model {MODEL}{skip} < {prompt_file}'
+    return f'claude -p --model {shlex.quote(MODEL)}{skip} < {shlex.quote(prompt_file)}'
 
 
 def write_prompt(project_dir, step_name, content):
@@ -400,12 +417,30 @@ def step_implement(tmux, project_dir):
     print("  -> implementation complete")
 
 
+def _check_makefile_safety(mk_path):
+    """Reject Makefiles containing shell-escape constructs that could run
+    arbitrary commands via $(shell ...) or backticks."""
+    content = mk_path.read_text()
+    # $(shell ...) and backtick command substitution in Make recipes
+    # are the main vectors for arbitrary code execution.
+    dangerous = re.findall(r'\$\(shell\b|`[^`]+`', content, re.IGNORECASE)
+    if dangerous:
+        print(f"  [!] Makefile contains dangerous constructs: {dangerous[:3]}",
+              file=sys.stderr)
+        print("      Refusing to execute. Remove $(shell ...) and backtick "
+              "substitutions.", file=sys.stderr)
+        return False
+    return True
+
+
 def step_verify(feature_slug, project_dir):
     """Run the verification Makefile. Returns True if all checks pass."""
     print("[step:verify] Running verification...")
     mk_path = Path(project_dir) / KISSKORC_DIR / f"verify-{feature_slug}.mk"
     if not mk_path.exists():
         print("  [!] Makefile not found, skipping verify")
+        return False
+    if not _check_makefile_safety(mk_path):
         return False
     result = subprocess.run(
         ["make", "-k", "-f", str(mk_path)],
@@ -467,15 +502,19 @@ def step_adversarial(tmux, project_dir):
         output_path=kp(project_dir, "adversarial-codex.md"),
     )
     pf = write_prompt(project_dir, "adversarial-codex", codex_prompt)
-    # Use a variable to avoid shell expansion of prompt content in double quotes
-    codex_cmd_str = f"prompt=$(<{pf}) && codex exec --full-auto -C {project_dir} \"$prompt\""
+    # Read prompt into a variable; double-quoted "$prompt" is safe against
+    # word splitting and globbing. Paths are shlex-quoted.
+    codex_cmd_str = f"prompt=$(<{shlex.quote(pf)}) && codex exec --full-auto -C {shlex.quote(project_dir)} \"$prompt\""
     run_in_tmux(tmux, codex_cmd_str, project_dir)
     print("  -> adversarial-codex.md")
 
-    # Check for critical/major findings
+    # Check for critical/major findings or missing review files (agent failure)
     for name in ["adversarial-claude.md", "adversarial-codex.md"]:
         p = Path(project_dir) / KISSKORC_DIR / name
-        if p.exists() and any(w in p.read_text().lower() for w in ["critical", "major"]):
+        if not p.exists():
+            print(f"  [!] {name} missing — treating as findings present", file=sys.stderr)
+            return True
+        if any(w in p.read_text().lower() for w in ["critical", "major"]):
             return True
     return False
 
@@ -499,6 +538,8 @@ def step_ship(feature_slug, project_dir):
     mk_path = Path(project_dir) / KISSKORC_DIR / f"verify-{feature_slug}.mk"
     if not mk_path.exists():
         print("  [!] No Makefile found. Cannot ship.")
+        return False
+    if not _check_makefile_safety(mk_path):
         return False
     result = subprocess.run(
         ["make", "-k", "-f", str(mk_path)],
@@ -555,11 +596,19 @@ def archive_run(project_dir, label=None):
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     if label:
-        archive_name = f"{ts}-{label}"
+        # Sanitize label: strip path separators and ".." to prevent traversal
+        safe_label = re.sub(r"[/\\]", "-", label).replace("..", "")
+        safe_label = safe_label.strip("-") or "unnamed"
+        archive_name = f"{ts}-{safe_label}"
     else:
         archive_name = ts
 
     archive_dir = korc_dir / "archive" / archive_name
+    # Verify the resolved path is still under the archive directory
+    expected_parent = (korc_dir / "archive").resolve()
+    if not archive_dir.resolve().is_relative_to(expected_parent):
+        print(f"Error: invalid archive label: {label!r}", file=sys.stderr)
+        return
     archive_dir.mkdir(parents=True, exist_ok=True)
 
     # Copy all non-archive, non-prompt artifacts
@@ -693,17 +742,65 @@ Usage:
   kiss-korc new              Read a feature description from stdin and run the
                              full pipeline (spec → encode → implement → review
                              → land → ship).
+  kiss-korc ask              Read a question from stdin, spawn a fresh agent,
+                             and print the answer to stdout.
   kiss-korc archive [label]  Archive the current .kisskorc/ artifacts. The label
                              argument is optional.
   kiss-korc help             Show this help message.
 
 Examples:
   echo 'Add auth' | kiss-korc new
+  echo 'What does this project do?' | kiss-korc ask
   kiss-korc archive my-label
   kiss-korc help"""
     print(cat, file=file)
     print(file=file)
     print(msg, file=file)
+
+
+def cmd_ask():
+    """Read a question from stdin, spawn a fresh agent, print the answer."""
+    _validate_model()
+
+    if sys.stdin.isatty():
+        print("Error: pipe a question to stdin", file=sys.stderr)
+        print("  echo 'What does this project do?' | kiss-korc ask", file=sys.stderr)
+        sys.exit(1)
+
+    question = sys.stdin.read().strip()
+    if not question:
+        print("Error: empty question", file=sys.stderr)
+        sys.exit(1)
+
+    cmd = ["claude", "-p", "--model", MODEL,
+           "--append-system-prompt",
+           "Always include relevant filenames and paths in your answers. "
+           "When asked about a file, repeat the filename in your response."]
+    if SKIP_PERMISSIONS:
+        cmd.append("--dangerously-skip-permissions")
+        print("Warning: agent runs with --dangerously-skip-permissions "
+              "(set KISSKORC_SKIP_PERMISSIONS=0 to disable)", file=sys.stderr)
+
+    wrapped = (
+        "Answer the following question about the codebase in the current "
+        "working directory. Read any files needed to answer accurately. "
+        "Include the filename(s) you referenced in your answer.\n\n"
+        f"Question: {question}"
+    )
+
+    result = subprocess.run(
+        cmd,
+        input=wrapped,
+        text=True,
+        capture_output=True,
+    )
+
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+
+    sys.exit(result.returncode)
 
 
 def main():
@@ -720,6 +817,10 @@ def main():
     if cmd == "archive":
         label = sys.argv[2] if len(sys.argv) > 2 else None
         archive_run(os.getcwd(), label)
+        return
+
+    if cmd == "ask":
+        cmd_ask()
         return
 
     if cmd == "new":
