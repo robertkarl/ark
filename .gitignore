@@ -1,7 +1,9 @@
+.kisskorc
 __pycache__/
 *.pyc
 *.pyo
 .ark/
+.claude/settings.local.json
 *.egg-info/
 dist/
 build/
