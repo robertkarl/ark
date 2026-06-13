@@ -236,6 +236,9 @@ class Tmux:
             if os.path.exists(sentinel_path):
                 os.unlink(sentinel_path)
                 return True
+            if not self.is_alive():
+                print("  [!] tmux session died", file=sys.stderr)
+                return False
             time.sleep(poll_interval)
         print(f"  [!] Timeout after {timeout}s waiting for agent", file=sys.stderr)
         return False
@@ -323,12 +326,22 @@ def create_branch(slug):
 
 
 def run_in_tmux(tmux, cmd, project_dir, timeout=1800):
-    """Send a command to the tmux worker and wait for it to finish."""
-    # Use a unique sentinel per invocation to avoid TOCTOU races with
-    # concurrent pipeline runs on the same project.
+    """Send a command to the tmux worker and wait for it to finish.
+
+    If the tmux session dies, recreates it and retries once.
+    """
     sentinel = os.path.join(project_dir, KISSKORC_DIR, f"_sentinel_{uuid.uuid4().hex[:8]}")
+    if not tmux.is_alive():
+        tmux.create_session(project_dir)
     tmux.send_command(cmd, sentinel_path=sentinel)
-    return tmux.wait_for_sentinel(sentinel, timeout=timeout)
+    ok = tmux.wait_for_sentinel(sentinel, timeout=timeout)
+    if not ok and not tmux.is_alive():
+        print("  [!] Retrying after tmux session loss", file=sys.stderr)
+        tmux.create_session(project_dir)
+        sentinel = os.path.join(project_dir, KISSKORC_DIR, f"_sentinel_{uuid.uuid4().hex[:8]}")
+        tmux.send_command(cmd, sentinel_path=sentinel)
+        ok = tmux.wait_for_sentinel(sentinel, timeout=timeout)
+    return ok
 
 
 SKIP_PERMISSIONS = os.environ.get("KISSKORC_SKIP_PERMISSIONS", "1") == "1"
