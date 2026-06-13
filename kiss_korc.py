@@ -12,6 +12,7 @@ Usage:
 # TODO: add the option for korc to spin up agents when it wants/needs
 # some judgement (like, "is this work good enough?")
 
+import hashlib
 import os
 import re
 import shutil
@@ -145,7 +146,17 @@ Read the spec at {spec_path} for context.
 # Configuration
 # ---------------------------------------------------------------------------
 
-MODEL = os.environ.get("KISSKORC_MODEL", "opus")
+_MODEL_RAW = os.environ.get("KISSKORC_MODEL", "opus")
+# Validate model name: only alphanumeric, hyphens, dots, and underscores allowed.
+# This prevents shell injection via crafted KISSKORC_MODEL values.
+if not re.fullmatch(r"[a-zA-Z0-9._-]+", _MODEL_RAW):
+    print(
+        f"Error: KISSKORC_MODEL contains invalid characters: {_MODEL_RAW!r}\n"
+        f"  Only alphanumeric characters, hyphens, dots, and underscores are allowed.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+MODEL = _MODEL_RAW
 MAX_LOOPS = 3
 KISSKORC_DIR = ".kisskorc"
 
@@ -239,9 +250,16 @@ def kf_exists(project_dir, filename):
 
 
 def slugify(text):
-    """Turn feature description into a short slug."""
+    """Turn feature description into a short slug.
+
+    Appends a short hash to avoid collisions when two features share the
+    same first 4 words (e.g., 'add auth login flow extra' vs
+    'add auth login flow different').
+    """
     words = re.sub(r"[^a-z0-9\s]", "", text.lower()).split()
-    return "-".join(words[:4]) or "feature"
+    base = "-".join(words[:4]) or "feature"
+    suffix = hashlib.sha1(text.lower().encode()).hexdigest()[:6]
+    return f"{base}-{suffix}"
 
 
 def ensure_dir(project_dir):
@@ -292,9 +310,17 @@ def run_in_tmux(tmux, cmd, project_dir, timeout=1800):
     return tmux.wait_for_sentinel(sentinel, timeout=timeout)
 
 
+SKIP_PERMISSIONS = os.environ.get("KISSKORC_SKIP_PERMISSIONS", "1") == "1"
+
+
 def claude_cmd(prompt_file):
-    """Build a claude -p command that reads its prompt from a file."""
-    return f'claude -p --model {MODEL} --dangerously-skip-permissions "$(cat {prompt_file})"'
+    """Build a claude -p command that reads its prompt from a file.
+
+    Uses stdin redirection (< file) instead of $(cat file) inside double quotes
+    to prevent shell interpretation of prompt file contents.
+    """
+    skip = " --dangerously-skip-permissions" if SKIP_PERMISSIONS else ""
+    return f'claude -p --model {MODEL}{skip} < {prompt_file}'
 
 
 def write_prompt(project_dir, step_name, content):
@@ -441,7 +467,8 @@ def step_adversarial(tmux, project_dir):
         output_path=kp(project_dir, "adversarial-codex.md"),
     )
     pf = write_prompt(project_dir, "adversarial-codex", codex_prompt)
-    codex_cmd_str = f'codex exec --full-auto -C {project_dir} "$(cat {pf})"'
+    # Use a variable to avoid shell expansion of prompt content in double quotes
+    codex_cmd_str = f"prompt=$(<{pf}) && codex exec --full-auto -C {project_dir} \"$prompt\""
     run_in_tmux(tmux, codex_cmd_str, project_dir)
     print("  -> adversarial-codex.md")
 
@@ -562,6 +589,9 @@ def run_pipeline(feature, project_dir):
     print(f"  project: {project_dir}")
     print(f"  artifacts: {korc_dir}")
     print(f"  tmux: {session_name}")
+    if SKIP_PERMISSIONS:
+        print("  WARNING: agents run with --dangerously-skip-permissions")
+        print("           set KISSKORC_SKIP_PERMISSIONS=0 to disable")
     print()
 
     # Save feature description
@@ -649,6 +679,12 @@ def run_pipeline(feature, project_dir):
 
 def print_help(file=sys.stdout):
     """Print the help message to the given file object."""
+    cat = r"""
+    /\_/\
+   ( o.o )
+    > ^ <
+   /|   |\
+  (_|   |_)""".lstrip("\n")
     msg = """\
 kiss-korc — a dumb Python orchestrator that runs a fixed, multi-phase pipeline
 for developing features using fresh-context AI agents in tmux.
@@ -665,6 +701,8 @@ Examples:
   echo 'Add auth' | kiss-korc new
   kiss-korc archive my-label
   kiss-korc help"""
+    print(cat, file=file)
+    print(file=file)
     print(msg, file=file)
 
 
