@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -170,12 +171,16 @@ class Tmux:
         """Send a command string to the worker window via a temp script.
 
         This avoids tmux send-keys buffer limits on long commands.
+        Uses mkstemp to avoid symlink attacks on predictable paths.
         """
-        script = Path("/tmp") / f"korc-{self.session}.sh"
-        script.write_text(f"#!/bin/bash\n{cmd}\n")
-        script.chmod(0o755)
+        fd, script_path = tempfile.mkstemp(prefix="korc-", suffix=".sh")
+        try:
+            os.write(fd, f"#!/bin/bash\n{cmd}\n".encode())
+        finally:
+            os.close(fd)
+        os.chmod(script_path, 0o700)
         subprocess.run(
-            ["tmux", "send-keys", "-t", self.session, f"bash {script}", "Enter"],
+            ["tmux", "send-keys", "-t", self.session, f"bash {script_path}", "Enter"],
             check=True,
         )
 
@@ -190,10 +195,31 @@ class Tmux:
     def wait_for_idle(self, poll_interval=5, timeout=1800):
         """Wait until the pane's shell has no child processes.
 
+        First waits for a child process to appear (command starting),
+        then waits for it to disappear (command finished).
         timeout: max seconds to wait (default 30 min)
         """
         start = time.time()
-        time.sleep(2)  # let the command start
+        startup_timeout = 30  # seconds to wait for command to start
+
+        # Phase 1: wait for a child process to appear
+        while time.time() - start < startup_timeout:
+            pid = self.pane_pid()
+            if not pid:
+                time.sleep(1)
+                continue
+            child_check = subprocess.run(
+                ["pgrep", "-P", pid], capture_output=True,
+            )
+            if child_check.returncode == 0:
+                break  # child appeared, command is running
+            time.sleep(1)
+        else:
+            print("  [!] Warning: no child process detected within "
+                  f"{startup_timeout}s, proceeding to poll anyway",
+                  file=sys.stderr)
+
+        # Phase 2: wait for the child process to disappear
         while time.time() - start < timeout:
             pid = self.pane_pid()
             if not pid:
@@ -273,7 +299,13 @@ def create_branch(slug):
         subprocess.run(["git", "checkout", "-b", branch], check=True)
 
     if stashed:
-        subprocess.run(["git", "stash", "pop"], capture_output=True)
+        pop = subprocess.run(["git", "stash", "pop"], capture_output=True, text=True)
+        if pop.returncode != 0:
+            print("  [!] git stash pop failed — your changes are still in the stash.",
+                  file=sys.stderr)
+            print(f"      {pop.stderr.strip()}", file=sys.stderr)
+            print("      Run 'git stash list' and 'git stash pop' manually to recover.",
+                  file=sys.stderr)
 
 
 def run_in_tmux(tmux, cmd, timeout=1800):
@@ -640,13 +672,37 @@ def run_pipeline(feature, project_dir):
 # ---------------------------------------------------------------------------
 
 
+def print_help(file=sys.stdout):
+    """Print the help message to the given file object."""
+    msg = """\
+kiss-korc — a dumb Python orchestrator that runs a fixed, multi-phase pipeline
+for developing features using fresh-context AI agents in tmux.
+
+Usage:
+  kiss-korc new              Read a feature description from stdin and run the
+                             full pipeline (spec → encode → implement → review
+                             → land → ship).
+  kiss-korc archive [label]  Archive the current .kisskorc/ artifacts. The label
+                             argument is optional.
+  kiss-korc help             Show this help message.
+
+Examples:
+  echo 'Add auth' | kiss-korc new
+  kiss-korc archive my-label
+  kiss-korc help"""
+    print(msg, file=file)
+
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage: echo 'feature' | kiss-korc new", file=sys.stderr)
-        print("       kiss-korc archive [label]", file=sys.stderr)
+        print_help(file=sys.stderr)
         sys.exit(1)
 
     cmd = sys.argv[1]
+
+    if cmd in ("help", "-h", "--help"):
+        print_help(file=sys.stdout)
+        sys.exit(0)
 
     if cmd == "archive":
         label = sys.argv[2] if len(sys.argv) > 2 else None
