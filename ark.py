@@ -1152,17 +1152,48 @@ def run_pipeline(feature, invocation_dir, driver="claude"):
     # is in flight: don't destroy its agent state — refuse rather than clobber.
     tmux = Tmux(session_name)
     if tmux.is_alive():
+        # A live session is the NORMAL state once a run has started: each step
+        # launches claude in pane 0's shell and ends it with "/exit", which
+        # quits the claude REPL but leaves the pane shell running. So the
+        # session stays alive from creation until something kills it.
+        #
+        # Distinguish the two reasons it can be alive here using the resume
+        # point (derived from on-disk artifacts):
+        #   1. No resume point -> no step has produced an artifact yet, so a
+        #      run is genuinely in flight from the start (e.g. a second `ark
+        #      new` racing the first). Refuse, to avoid clobbering its agent.
+        #   2. A resume point exists -> the previous step completed (artifact on
+        #      disk) and the session is just sitting at the pane shell (or an
+        #      interactive agent someone left open). Reuse it: send "/exit" to
+        #      drop any lingering claude REPL back to the shell, then proceed
+        #      with a fresh agent for the next step.
+        if resume_after is None:
+            print(
+                f"Error: a run for this feature is already in flight "
+                f"(tmux session '{session_name}' is alive).\n"
+                f"  Attach with: tmux attach -t {session_name}\n"
+                f"  Or kill it first: tmux kill-session -t {session_name}",
+                file=sys.stderr,
+            )
+            return 1
         print(
-            f"Error: a run for this feature is already in flight "
-            f"(tmux session '{session_name}' is alive).\n"
-            f"  Attach with: tmux attach -t {session_name}\n"
-            f"  Or kill it first: tmux kill-session -t {session_name}",
-            file=sys.stderr,
+            f"  Reusing live session '{session_name}' (idle after "
+            f"'{resume_after}'); clearing any open agent."
         )
-        return 1
-    # Reap any dead/leftover registration for this name, then create fresh.
-    tmux.kill_session()
-    tmux.create_session(project_dir)
+        # No-op if the pane is already at a shell prompt ("/exit" is just an
+        # unknown command); ends the REPL if an interactive agent was left open.
+        subprocess.run(
+            ["tmux", "send-keys", "-t", session_name, "/exit", "Enter"],
+            capture_output=True,
+        )
+        time.sleep(2)
+        # Defensive: if "/exit" somehow took down the session, recreate it.
+        if not tmux.is_alive():
+            tmux.create_session(project_dir)
+    else:
+        # Reap any dead/leftover registration for this name, then create fresh.
+        tmux.kill_session()
+        tmux.create_session(project_dir)
 
     print(f"  Attach with: tmux attach -t {session_name}\n")
 
