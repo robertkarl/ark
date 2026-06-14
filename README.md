@@ -38,8 +38,31 @@ cat feature.txt | ark new
 9. *(loop 5-8 up to 3 times)*
 10. **adversarial** — claude + codex review in parallel, write findings
 11. **land** — fresh agent addresses critical/major findings
+12. **introspect** — after the run reaches a terminal outcome (lands, or
+    exhausts the implement/verify or review-fix loop) and is archived, a
+    fresh agent reflects on how *ark itself* behaved and records **lessons**
 
 Each agent gets fresh context. No state bleeds between steps. The Python script decides what runs next — not an LLM.
+
+## Lessons (self-improvement)
+
+After a run reaches a terminal outcome and its artifacts are archived, ark runs
+a post-hoc **introspection** step. A fresh-context agent reads the archived run
+and records high-precision, actionable **lessons** about ark the harness — its
+timeouts, prompts, pipeline structure, loop bounds — that hurt the run. Each
+lesson is two sentences: one observation, one proposed ~one-line fix.
+
+- Lessons accumulate in a machine-global, append-only file at `~/.ark/LESSONS.md`
+  (one per machine, outside any repo). A run-local copy is also written into the
+  run's archive directory.
+- Every agent step injects the current contents of `~/.ark/LESSONS.md` into its
+  prompt, re-read fresh each step — so editing the file mid-run takes effect at
+  the next step. An absent or empty file is a clean no-op.
+- Introspection is **best-effort**: if it fails, the run's exit status is
+  unchanged. It never runs on hard aborts (no git repo, empty feature, missing
+  spec) because those produce no archive directory.
+- Producing zero lessons is normal, especially for clean runs — ark never
+  fabricates a lesson. The file is append-only; prune it by hand.
 
 ## How it works
 

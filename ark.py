@@ -199,6 +199,54 @@ Rules:
 - Do not push to any remote.
 """
 
+PROMPT_INTROSPECT = """\
+You are a post-hoc introspection agent. An ark run just finished. ark is the \
+orchestrator/harness that ran a fixed pipeline of fresh-context LLM agents \
+(spec, review, encode, implement, verify, adversarial review, fix). Your job \
+is to look at the run that just finished and record LESSONS about *ark itself* \
+— the harness — that hurt this run, so a human operator can improve ark.
+
+This run's terminal outcome was: {outcome}
+
+The run's artifacts have been archived. Read them from the archive directory:
+    {archive_dir}
+That directory contains this run's SPEC.md, review notes, verification output \
+(REVIEW.md), adversarial review reports, and other artifacts. Read whatever \
+you need from there to understand how the run went. Examine ONLY this run's \
+own artifacts — do not read other runs' archives.
+
+What qualifies as a LESSON (be strict — precision over recall):
+- It is about ARK THE HARNESS: its orchestration, timeouts, prompts, pipeline \
+structure, loop bounds, archive behavior, or similar. NOT about the target \
+codebase or the specific feature that was being built.
+- It is CAUSAL: it identifies something that actually degraded or broke this \
+run (a timeout/race that derailed it, a loop that degenerated, a prompt that \
+misled an agent). Not cosmetic, not incidental, not a superstitious \
+correlation (e.g. "runs fail when a filename contains a certain word").
+- It can be PAIRED WITH A PLAUSIBLE FIX expressible as roughly a one-line ark \
+change or a single spec item that could be fed back into ark.
+- If you cannot pair an observation with a plausible ark fix, DISCARD it. Do \
+not record a fix-less or one-clause note.
+
+Authoring format for each lesson — exactly TWO prose sentences:
+1. The observation: what about ark hurt this run.
+2. The proposed fix: a ~one-line ark change that would address it.
+Write each lesson as prose (NOT a bulleted list). Separate multiple lessons \
+with a blank line.
+
+Producing ZERO lessons is a valid and expected outcome, especially for a \
+clean successful run. Do NOT fabricate a lesson to appear productive.
+
+Output:
+- If and only if you have one or more real lessons, write them to {output_path}.
+- Each lesson you write must be on its own (it may span the two sentences).
+- If you have NO lessons, do NOT create {output_path} at all (leave it absent). \
+Write nothing rather than an empty or placeholder lesson.
+
+Do NOT modify the source tree, do not commit, do not merge, do not push, and \
+do not start a new ark pipeline. Your only output is the lessons file above.
+"""
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -209,6 +257,12 @@ MODEL = _MODEL_RAW
 MAX_LOOPS = 3
 MAX_REVIEW_LOOPS = 3
 ARK_DIR = ".ark"
+# Machine-global, append-only lessons file (one per machine, outside any repo).
+# Introspection appends lessons here; every agent step injects its contents.
+GLOBAL_LESSONS_FILE = Path("~/.ark/LESSONS.md").expanduser()
+# Run-local copy of lessons, written into the archive directory alongside the
+# archived SPEC.md and other artifacts (AC-21).
+RUN_LESSONS_FILENAME = "LESSONS.md"
 # Worktrees live under .git/<WORKTREE_SUBDIR>/<slug>. This keeps them out of
 # the repository-root working tree (so they never show up as tracked or
 # untracked entries) while remaining deterministic and tied to the repo.
@@ -629,10 +683,41 @@ def driver_cmd(
     return claude_cmd(prompt_file)
 
 
+def lessons_injection():
+    """Return a prompt block injecting ~/.ark/LESSONS.md, re-read fresh.
+
+    Called at the moment each agent step builds its prompt (AC-24, AC-25), so an
+    operator editing the file mid-run has the edit picked up at the next step.
+    If the file is absent, or empty/whitespace-only, injection is a clean no-op:
+    returns "" so the agent step proceeds normally (AC-26, EC-7).
+    """
+    try:
+        content = GLOBAL_LESSONS_FILE.read_text()
+    except (FileNotFoundError, OSError):
+        return ""
+    if not content.strip():
+        return ""
+    return (
+        "\n\n---\n"
+        "ARK LESSONS (observations about the ark harness itself from past "
+        "runs, with proposed fixes). Keep these in mind; they describe how ark "
+        "has hurt prior runs:\n\n"
+        f"{content.strip()}\n"
+        "--- end ark lessons ---\n"
+    )
+
+
 def write_prompt(project_dir, step_name, content):
-    """Write a prompt to a temp file, return its path."""
+    """Write a prompt to a temp file, return its path.
+
+    Every agent step routes its prompt through here, so injecting the global
+    lessons file at this single point applies uniformly to all agent steps
+    (AC-24, AC-27) — including introspection, which builds its prompt before it
+    appends its own lesson (AC-27a). The non-agent verify step never calls this,
+    so it is unaffected (AC-28).
+    """
     p = Path(project_dir) / ARK_DIR / f"_prompt_{step_name}.md"
-    p.write_text(content)
+    p.write_text(content + lessons_injection())
     return str(p)
 
 
@@ -909,6 +994,77 @@ def archive_run(project_dir, label=None):
 
 
 # ---------------------------------------------------------------------------
+# Introspection — post-hoc reflection on the run that just finished
+# ---------------------------------------------------------------------------
+
+
+def _append_global_lessons(slug, lessons_text):
+    """Append a run's lessons to ~/.ark/LESSONS.md (AC-18, AC-19, AC-20, AC-22).
+
+    Creates ~/.ark/ and the file if absent (AC-20). Append-only: existing
+    content is preserved (AC-19). The entry is introduced by a header carrying
+    the run's slug so it is traceable by a literal search for the slug (AC-22).
+    """
+    GLOBAL_LESSONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"\n## {slug} ({ts})\n\n{lessons_text.strip()}\n"
+    with open(GLOBAL_LESSONS_FILE, "a") as f:
+        f.write(entry)
+
+
+def step_introspect(tmux, project_dir, archive_dir, slug, outcome):
+    """Post-hoc introspection: reflect on the finished run, record lessons.
+
+    Best-effort and never a gate (AC-29): any failure here is swallowed so the
+    run's exit status is unchanged. Reads the run's artifacts from the archive
+    directory (AC-8) and is told the terminal outcome (AC-9). If the agent
+    produces lessons, they are dual-written: appended to ~/.ark/LESSONS.md
+    (AC-18) and copied into the archive directory (AC-21). Zero lessons makes no
+    modification to either location (AC-17, AC-23).
+    """
+    print("[step:introspect] Reflecting on the run...")
+    try:
+        # The introspection agent writes lessons (if any) to a scratch file in
+        # the live .ark/ — NOT directly into the archive — so we control the
+        # dual write and the "zero lessons => no file" semantics ourselves.
+        scratch_name = "_introspect_lessons.md"
+        scratch_path = Path(project_dir) / ARK_DIR / scratch_name
+        if scratch_path.exists():
+            scratch_path.unlink()
+
+        sentinel = make_sentinel(project_dir)
+        prompt = PROMPT_INTROSPECT.format(
+            outcome=outcome,
+            archive_dir=str(archive_dir),
+            output_path=str(scratch_path),
+        ) + PROMPT_SENTINEL.format(sentinel_path=sentinel)
+        # write_prompt injects ~/.ark/LESSONS.md as of now — before we append
+        # this run's lesson — so introspection never injects the lesson it is
+        # about to write (AC-27, AC-27a).
+        pf = write_prompt(project_dir, "introspect", prompt)
+        run_in_tmux(tmux, claude_cmd(pf), sentinel)
+
+        # Zero lessons is valid: no file (or empty file) => no writes anywhere.
+        if not scratch_path.exists():
+            print("  -> no lessons recorded")
+            return
+        lessons_text = scratch_path.read_text()
+        if not lessons_text.strip():
+            print("  -> no lessons recorded")
+            return
+
+        # Dual write: global append (AC-18) + run-local copy in the archive
+        # directory (AC-21).
+        _append_global_lessons(slug, lessons_text)
+        run_local = Path(archive_dir) / RUN_LESSONS_FILENAME
+        run_local.write_text(lessons_text.strip() + "\n")
+        print(f"  -> lessons appended to {GLOBAL_LESSONS_FILE}")
+        print(f"  -> run-local copy at {run_local}")
+    except Exception as e:  # best-effort: never let introspection break the run
+        print(f"  [!] introspection failed (ignored): {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -1038,7 +1194,13 @@ def run_pipeline(feature, invocation_dir, driver="claude"):
 
     if not passed:
         print(f"\n  FAILED after {MAX_LOOPS} attempts.")
-        archive_run(project_dir, feature_slug)
+        archive_dir = archive_run(project_dir, feature_slug)
+        if archive_dir is not None:
+            step_introspect(
+                tmux, project_dir, archive_dir, feature_slug,
+                outcome="exhausted the implement/verify loop "
+                        "(implementation never passed verification)",
+            )
         return 1
 
     # Phase 4: Review-fix loop
@@ -1068,11 +1230,24 @@ def run_pipeline(feature, invocation_dir, driver="claude"):
 
     if not review_pass:
         print(f"\n  Review-fix loop exhausted after {MAX_REVIEW_LOOPS} iterations")
-        archive_run(project_dir, feature_slug)
+        archive_dir = archive_run(project_dir, feature_slug)
+        if archive_dir is not None:
+            step_introspect(
+                tmux, project_dir, archive_dir, feature_slug,
+                outcome="exhausted the review-fix loop "
+                        "(adversarial findings remained after the allowed "
+                        "iterations)",
+            )
         return 1
 
     # Archive results
-    archive_run(project_dir, feature_slug)
+    archive_dir = archive_run(project_dir, feature_slug)
+    if archive_dir is not None:
+        step_introspect(
+            tmux, project_dir, archive_dir, feature_slug,
+            outcome="succeeded (the implementation passed verification and "
+                    "adversarial review)",
+        )
 
     # FR-6: results are discoverable from the repository root via the branch.
     print(f"\n  Done. Branch ark/{feature_slug} is ready to merge.")
