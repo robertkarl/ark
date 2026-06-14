@@ -907,17 +907,25 @@ def run_in_tmux(
                 capture_output=True,
             )
             time.sleep(2)
-    elif not _finished(outcome) and tmux.is_alive():
-        # Idle/hard timeout: the session is still alive with the original (hung)
-        # interactive agent at its prompt. Kill the stale pane so that any
-        # subsequent retry attempt (run_pipeline loops back into run_in_tmux)
-        # creates a fresh session via the `not is_alive()` branch above, instead
-        # of stacking a second agent command onto the still-live hung pane.
-        # Tearing down the tmux pane does NOT truncate or delete the in-flight
-        # job's output artifacts, which live on the worktree filesystem
-        # (FR-9/EC-8) — it only frees the interactive session for a clean retry.
+    elif outcome is StepOutcome.IDLE_TIMEOUT and tmux.is_alive():
+        # IDLE_TIMEOUT only: the session is alive with the original agent hung at
+        # its prompt (no progress for >= ARK_IDLE_TIMEOUT — by definition nothing
+        # is actively writing). This is the one non-finishing outcome that loops
+        # back into run_in_tmux for a retry (run_pipeline retries idle timeouts
+        # without consuming a MAX_LOOPS attempt). Kill the stale pane so the retry
+        # creates a fresh session via the `not is_alive()` branch above instead of
+        # stacking a second agent command onto the hung pane. Tearing down the
+        # pane of an idle agent does NOT disturb any in-flight write (FR-9/EC-8).
+        #
+        # HARD_TIMEOUT is deliberately NOT killed here: the hard ceiling can fire
+        # while output is still advancing (AC-7), and it is terminal — run_pipeline
+        # breaks immediately without retrying, so no clean pane is needed. Killing
+        # the session would SIGHUP a still-progressing foreground job, which FR-9
+        # forbids ("never kill a job that is still writing output"). We report the
+        # HARD_TIMEOUT outcome and leave the live process and its artifacts intact
+        # (EC-8).
         print(
-            "  [!] Killing stale tmux pane after non-finishing outcome "
+            "  [!] Killing stale tmux pane after idle timeout "
             f"({outcome}) so the next attempt starts clean",
             file=sys.stderr,
         )

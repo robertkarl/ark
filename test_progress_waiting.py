@@ -786,3 +786,25 @@ def test_idle_timeout_retry_creates_fresh_session_not_double_send(
     # The retry created a fresh session before sending — never a bare second send
     # into the still-live original pane.
     assert tmux.events[2:4] == ["create", "send"]
+
+
+def test_hard_timeout_does_not_kill_progressing_session(tmp_path):
+    """FR-9 / AC-7 / EC-8 (BLOCK fix): the hard ceiling can fire while a job is
+    still actively writing output. run_in_tmux MUST report HARD_TIMEOUT but MUST
+    NOT kill the still-alive session — killing would SIGHUP a live foreground job
+    that is still producing output, which FR-9 forbids. HARD_TIMEOUT is terminal
+    (run_pipeline never retries it), so no clean pane is needed."""
+    ark_dir = tmp_path / ark.ARK_DIR
+    ark_dir.mkdir(parents=True)
+    sentinel = str(ark_dir / "sentinel")
+
+    tmux = _RecordingTmux([StepOutcome.HARD_TIMEOUT], alive=True)
+    outcome = ark.run_in_tmux(
+        tmux, "agent-cmd", sentinel,
+        progress_probe=[str(tmp_path)],
+    )
+
+    assert outcome == StepOutcome.HARD_TIMEOUT
+    # Only the command was sent; the live session was left running (no "kill").
+    assert tmux.events == ["send"]
+    assert tmux.is_alive()
