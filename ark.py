@@ -322,13 +322,21 @@ class Tmux:
 
     @property
     def agent_target(self):
-        """send-keys/-t target for the agent pane (pane 0)."""
-        return f"{self.session}.{AGENT_PANE}"
+        """send-keys/-t target for the agent pane (pane 0).
+
+        Uses the canonical ``session:.pane`` form. tmux parses a target by
+        splitting on ':' first, so the bare ``session.pane`` shape is treated
+        as a session *name* containing a dot rather than a pane address; the
+        explicit (empty-window) colon disambiguates it to the current window's
+        pane inside this session regardless of the window's name/index.
+        """
+        return f"{self.session}:.{AGENT_PANE}"
 
     @property
     def status_target(self):
-        """send-keys/-t target for the status pane (pane 1)."""
-        return f"{self.session}.{STATUS_PANE}"
+        """send-keys/-t target for the status pane (pane 1). See agent_target
+        for why the canonical ``session:.pane`` form is required."""
+        return f"{self.session}:.{STATUS_PANE}"
 
     def create_session(self, working_dir):
         """Create a detached two-pane session with the agent pane primary.
@@ -401,7 +409,7 @@ class Tmux:
             os.close(fd)
         os.chmod(script_path, 0o700)
         subprocess.run(
-            ["tmux", "send-keys", "-t", f"{self.session}.{pane}",
+            ["tmux", "send-keys", "-t", f"{self.session}:.{pane}",
              f"bash {script_path}", "Enter"],
             check=True,
         )
@@ -431,7 +439,17 @@ class Tmux:
 
         Blocks until the user detaches or the session ends. Detaching leaves the
         session — and the orchestrator running inside it — alive (FR-6).
+
+        A tmux session restores whichever pane was active when the user last
+        detached, so make the agent pane active first: re-attaches (including
+        `ark continue` after a detach) must come up with the agent pane primary
+        even if the user had focused the status pane before detaching (AC-3,
+        AC-18).
         """
+        subprocess.run(
+            ["tmux", "select-pane", "-t", self.agent_target],
+            capture_output=True,
+        )
         subprocess.run(["tmux", "attach-session", "-t", self.session])
 
     def wait_for_sentinel(self, sentinel_path, poll_interval=5, timeout=1800):
@@ -1238,18 +1256,30 @@ def _launch_inner_orchestrator(tmux, project_dir, feature_slug, driver):
     itself, so only the agents it spawns are blocked from recursing.
     """
     ark_py = os.path.abspath(__file__)
-    env_prefix = (
-        f"ARK_INNER=1 "
-        f"ARK_SESSION={shlex.quote(tmux.session)} "
-        f"ARK_WORKDIR={shlex.quote(project_dir)} "
-        f"ARK_SLUG={shlex.quote(feature_slug)} "
-        f"ARK_DRIVER={shlex.quote(driver)}"
-    )
+    env_parts = [
+        "ARK_INNER=1",
+        f"ARK_SESSION={shlex.quote(tmux.session)}",
+        f"ARK_WORKDIR={shlex.quote(project_dir)}",
+        f"ARK_SLUG={shlex.quote(feature_slug)}",
+        f"ARK_DRIVER={shlex.quote(driver)}",
+    ]
+    # The inner orchestrator is a fresh shell started by the tmux SERVER, so it
+    # inherits the tmux server's environment snapshot — NOT this outer ark
+    # process's environment. An inline `ARK_SKIP_PERMISSIONS=0 ark new …` (set
+    # only for the ark process) would otherwise be dropped, and the inner driver
+    # would build agent commands with the default skip-permissions/model. Forward
+    # them explicitly so interactive runs honor the same config as the outer
+    # process and the headless path (AC-23, AC-25).
+    for var in ("ARK_SKIP_PERMISSIONS", "ARK_MODEL"):
+        val = os.environ.get(var)
+        if val is not None:
+            env_parts.append(f"{var}={shlex.quote(val)}")
+    env_prefix = " ".join(env_parts)
     cmd = f"{env_prefix} {shlex.quote(sys.executable)} {shlex.quote(ark_py)} _inner"
     tmux.send_command(cmd, pane=STATUS_PANE)
 
 
-def run_pipeline(feature, invocation_dir, driver="claude"):
+def run_pipeline(feature, invocation_dir, driver="claude", is_continue=False):
     """Set up the run's topology, then drive (or hand off) the pipeline.
 
     This is the OUTER entry invoked by `ark new`/`ark continue`. It performs the
@@ -1347,19 +1377,28 @@ def run_pipeline(feature, invocation_dir, driver="claude"):
         #      interactive agent someone left open). Reuse its two-pane layout
         #      (AC-29): drop any lingering REPL in the agent pane back to its
         #      shell, then proceed with a fresh agent for the next step.
-        if resume_after is None:
-            print(
-                f"Error: a run for this feature is already in flight "
-                f"(tmux session '{session_name}' is alive).\n"
-                f"  Attach with: tmux attach -t {session_name}\n"
-                f"  Or kill it first: tmux kill-session -t {session_name}",
-                file=sys.stderr,
-            )
-            return 1
         # If an orchestrator is already driving pane 1 (a detached-from
         # interactive run), this is a pure re-attach: don't disturb the agent
         # pane and don't launch a second driver (AC-9, AC-18).
         already_driving = tmux.has_two_panes() and tmux.status_pane_busy()
+        if resume_after is None:
+            # No step has produced a resumable artifact yet. A detached
+            # interactive run during the very first (spec) step is exactly this
+            # state — the orchestrator is live in pane 1 but SPEC.md doesn't
+            # exist yet. `ark continue` to such a run must re-attach (AC-15,
+            # AC-18, detach-survival for the first step), so allow it through
+            # when an orchestrator is already driving. Any other case — a second
+            # `ark new` racing the first, or a session with no live driver — is
+            # a genuine in-flight/half-built run we must not clobber (AC-28).
+            if not (is_continue and already_driving):
+                print(
+                    f"Error: a run for this feature is already in flight "
+                    f"(tmux session '{session_name}' is alive).\n"
+                    f"  Attach with: tmux attach -t {session_name}\n"
+                    f"  Or kill it first: tmux kill-session -t {session_name}",
+                    file=sys.stderr,
+                )
+                return 1
         if already_driving:
             print(
                 f"  Re-attaching to live session '{session_name}' — an "
@@ -1710,8 +1749,11 @@ def main():
         driver_file = Path(run_dir) / ARK_DIR / "DRIVER"
         driver = driver_file.read_text().strip() if driver_file.exists() else "claude"
         # run_pipeline re-derives the slug from the feature and reuses the
-        # existing worktree/branch (AC-16, AC-17).
-        sys.exit(run_pipeline(feature, invocation_dir, driver=driver))
+        # existing worktree/branch (AC-16, AC-17). is_continue lets it re-attach
+        # to a detached interactive run that hasn't produced its first artifact
+        # yet (detach-survival during the spec step) instead of refusing it.
+        sys.exit(run_pipeline(feature, invocation_dir, driver=driver,
+                              is_continue=True))
 
     if cmd == "new":
         # Parse --driver flag and optional positional argument
