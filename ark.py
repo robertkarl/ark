@@ -907,6 +907,21 @@ def run_in_tmux(
                 capture_output=True,
             )
             time.sleep(2)
+    elif not _finished(outcome) and tmux.is_alive():
+        # Idle/hard timeout: the session is still alive with the original (hung)
+        # interactive agent at its prompt. Kill the stale pane so that any
+        # subsequent retry attempt (run_pipeline loops back into run_in_tmux)
+        # creates a fresh session via the `not is_alive()` branch above, instead
+        # of stacking a second agent command onto the still-live hung pane.
+        # Tearing down the tmux pane does NOT truncate or delete the in-flight
+        # job's output artifacts, which live on the worktree filesystem
+        # (FR-9/EC-8) — it only frees the interactive session for a clean retry.
+        print(
+            "  [!] Killing stale tmux pane after non-finishing outcome "
+            f"({outcome}) so the next attempt starts clean",
+            file=sys.stderr,
+        )
+        tmux.kill_session()
     return outcome
 
 

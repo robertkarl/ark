@@ -696,3 +696,93 @@ def test_ac21_recursion_guard_blocks_nested_run(monkeypatch, tmp_path, capsys):
     with pytest.raises(SystemExit) as ei:
         ark.run_pipeline("x", str(tmp_path))
     assert ei.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# Idle-timeout retry safety (FR-9): run_in_tmux must not stack a second agent
+# command onto a still-live hung pane. After a non-finishing, still-alive
+# outcome it kills the stale session so the NEXT attempt starts clean.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingTmux(ark.Tmux):
+    """Tmux double that records lifecycle calls and stubs wait_for_sentinel.
+
+    `outcomes` is a list returned by successive wait_for_sentinel() calls so a
+    test can simulate one or more non-finishing waits.
+    """
+
+    def __init__(self, outcomes, alive=True):
+        super().__init__("rec-session")
+        self._outcomes = list(outcomes)
+        self.alive = alive
+        self.events = []
+
+    def is_alive(self):
+        return self.alive
+
+    def create_session(self, working_dir):
+        self.events.append("create")
+        self.alive = True
+
+    def send_command(self, cmd):
+        self.events.append("send")
+
+    def kill_session(self):
+        self.events.append("kill")
+        self.alive = False
+
+    def wait_for_sentinel(self, sentinel, **kwargs):
+        return self._outcomes.pop(0)
+
+
+def test_idle_timeout_kills_stale_pane_so_retry_starts_clean(tmp_path):
+    """FR-9 / BLOCK fix: an IDLE_TIMEOUT leaves the tmux session alive. run_in_tmux
+    must tear down that stale pane so a subsequent retry creates a fresh session
+    instead of sending a second agent command into the still-live hung pane."""
+    ark_dir = tmp_path / ark.ARK_DIR
+    ark_dir.mkdir(parents=True)
+    sentinel = str(ark_dir / "sentinel")
+
+    tmux = _RecordingTmux([StepOutcome.IDLE_TIMEOUT], alive=True)
+    outcome = ark.run_in_tmux(
+        tmux, "agent-cmd", sentinel,
+        progress_probe=[str(tmp_path)],
+    )
+
+    assert outcome == StepOutcome.IDLE_TIMEOUT
+    # The first attempt sent the command, then the stale (still-alive) pane was
+    # killed. No second send happened on this still-alive, non-finishing path.
+    assert tmux.events == ["send", "kill"]
+    # Session is now dead, so the next run_in_tmux call will create a fresh one.
+    assert not tmux.is_alive()
+
+
+def test_idle_timeout_retry_creates_fresh_session_not_double_send(
+        monkeypatch, tmp_path):
+    """The two-call sequence: an idle timeout followed by a finishing retry must
+    create a NEW session for the retry (clean pane) rather than stacking a second
+    send onto the original hung pane."""
+    # The FINISHED branch sends /exit keys and sleeps; stub both so the test
+    # neither touches real tmux nor sleeps for real time (AC-21 spirit).
+    monkeypatch.setattr(ark.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(ark.time, "sleep", lambda *a, **k: None)
+    ark_dir = tmp_path / ark.ARK_DIR
+    ark_dir.mkdir(parents=True)
+    sentinel = str(ark_dir / "sentinel")
+
+    tmux = _RecordingTmux(
+        [StepOutcome.IDLE_TIMEOUT, StepOutcome.FINISHED], alive=True)
+
+    first = ark.run_in_tmux(
+        tmux, "agent-cmd", sentinel, progress_probe=[str(tmp_path)])
+    assert first == StepOutcome.IDLE_TIMEOUT
+    assert tmux.events == ["send", "kill"]
+    assert not tmux.is_alive()
+
+    second = ark.run_in_tmux(
+        tmux, "agent-cmd", sentinel, progress_probe=[str(tmp_path)])
+    assert second == StepOutcome.FINISHED
+    # The retry created a fresh session before sending — never a bare second send
+    # into the still-live original pane.
+    assert tmux.events[2:4] == ["create", "send"]
