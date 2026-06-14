@@ -288,25 +288,107 @@ def _validate_model():
     _MODEL_VALIDATED = True
 
 # ---------------------------------------------------------------------------
-# Tmux helpers — ark runs in your terminal, tmux is the worker
+# Tmux helpers — the agent is the foreground; tmux carries the whole run
 # ---------------------------------------------------------------------------
+
+# Pane layout (FR-1): the AGENT pane is primary/large and active; the STATUS
+# pane is the small secondary strip in which the orchestrator's driver loop and
+# its [step:...] progress run. The status pane is a minority of the split
+# dimension so the agent pane spans the majority (AC-2).
+AGENT_PANE = 0
+STATUS_PANE = 1
+# Status pane gets a minority of the window along the split dimension; the agent
+# pane gets the rest (>=60%, AC-2). 25% leaves the agent ~75%.
+STATUS_PANE_SIZE = "25%"
+
+
+class TmuxError(Exception):
+    """tmux is unavailable or a tmux operation failed (EC-9 / AC-42)."""
 
 
 class Tmux:
-    """Manage a single tmux session with one window for the worker agent."""
+    """Manage a single tmux session laid out as two panes:
+
+    pane 0 (AGENT_PANE)  — primary/large/active, where each step's agent runs.
+    pane 1 (STATUS_PANE) — small secondary strip, where the orchestrator's
+                           driver loop and its [step:...] progress run.
+
+    The orchestrator drives the agent pane via send-keys to pane 0 and polls for
+    the agent's sentinel exactly as before; only the on-screen topology changed.
+    """
 
     def __init__(self, session_name):
         self.session = session_name
 
+    @property
+    def agent_target(self):
+        """send-keys/-t target for the agent pane (pane 0)."""
+        return f"{self.session}.{AGENT_PANE}"
+
+    @property
+    def status_target(self):
+        """send-keys/-t target for the status pane (pane 1)."""
+        return f"{self.session}.{STATUS_PANE}"
+
     def create_session(self, working_dir):
-        """Create a detached tmux session."""
+        """Create a detached two-pane session with the agent pane primary.
+
+        Raises TmuxError if tmux is unavailable or session/pane creation fails,
+        so the caller can fail loudly instead of later hanging on a sentinel in
+        a session that was never built (EC-9 / AC-42).
+        """
+        try:
+            new = subprocess.run(
+                ["tmux", "new-session", "-d", "-s", self.session, "-c",
+                 working_dir],
+                capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            # tmux binary not installed/usable (EC-9 / AC-42).
+            raise TmuxError(
+                "tmux is not installed or not on PATH — ark needs tmux to run "
+                "the agent and orchestrator panes."
+            )
+        if new.returncode != 0:
+            raise TmuxError(
+                f"failed to create tmux session '{self.session}': "
+                f"{new.stderr.strip() or 'tmux unavailable'}"
+            )
+        # Split off a small secondary pane (pane 1). The new pane becomes active
+        # and would normally take ~50%; size it to a minority and hand focus back
+        # to the agent pane (pane 0) so the agent is dominant and active (AC-2,
+        # AC-3).
+        split = subprocess.run(
+            ["tmux", "split-window", "-v", "-l", STATUS_PANE_SIZE,
+             "-t", self.session, "-c", working_dir],
+            capture_output=True, text=True,
+        )
+        if split.returncode != 0:
+            # Don't leave a half-built single-pane layout that a later
+            # `ark continue` would mistake for a healthy run (AC-42).
+            self.kill_session()
+            raise TmuxError(
+                f"failed to split tmux session '{self.session}' into two panes: "
+                f"{split.stderr.strip() or 'tmux split-window failed'}"
+            )
         subprocess.run(
-            ["tmux", "new-session", "-d", "-s", self.session, "-c", working_dir],
-            check=True,
+            ["tmux", "select-pane", "-t", self.agent_target],
+            capture_output=True,
         )
 
-    def send_command(self, cmd):
-        """Send a command string to the worker window via a temp script.
+    def has_two_panes(self):
+        """True if the session is alive and already has both panes (AC-15)."""
+        result = subprocess.run(
+            ["tmux", "list-panes", "-t", self.session, "-F", "#{pane_index}"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return False
+        return len([l for l in result.stdout.splitlines() if l.strip()]) >= 2
+
+    def send_command(self, cmd, pane=AGENT_PANE):
+        """Send a command string to a pane (default: the agent pane) via a
+        temp script.
 
         This avoids tmux send-keys buffer limits on long commands.
         Uses mkstemp to avoid symlink attacks on predictable paths.
@@ -319,17 +401,38 @@ class Tmux:
             os.close(fd)
         os.chmod(script_path, 0o700)
         subprocess.run(
-            ["tmux", "send-keys", "-t", self.session, f"bash {script_path}", "Enter"],
+            ["tmux", "send-keys", "-t", f"{self.session}.{pane}",
+             f"bash {script_path}", "Enter"],
             check=True,
         )
 
+    def exit_agent_repl(self):
+        """Drop any interactive agent REPL in the agent pane back to its shell.
+
+        Sent to the agent pane (pane 0), not the session default, so the
+        orchestrator running in the status pane (pane 1) is never disturbed
+        (AC-13).
+        """
+        subprocess.run(
+            ["tmux", "send-keys", "-t", self.agent_target, "/exit", "Enter"],
+            capture_output=True,
+        )
+
     def pane_pid(self):
-        """Get the shell PID of the worker pane."""
+        """Get the shell PID of the agent pane."""
         result = subprocess.run(
-            ["tmux", "list-panes", "-t", self.session, "-F", "#{pane_pid}"],
+            ["tmux", "list-panes", "-t", self.agent_target, "-F", "#{pane_pid}"],
             capture_output=True, text=True,
         )
         return result.stdout.strip().split("\n")[0] if result.stdout.strip() else None
+
+    def attach(self):
+        """Attach the user's terminal to the session (interactive runs).
+
+        Blocks until the user detaches or the session ends. Detaching leaves the
+        session — and the orchestrator running inside it — alive (FR-6).
+        """
+        subprocess.run(["tmux", "attach-session", "-t", self.session])
 
     def wait_for_sentinel(self, sentinel_path, poll_interval=5, timeout=1800):
         """Wait for a sentinel file to appear, meaning the command finished."""
@@ -346,18 +449,51 @@ class Tmux:
         return False
 
     def is_alive(self):
-        """Check if the tmux session still exists."""
-        result = subprocess.run(
-            ["tmux", "has-session", "-t", self.session],
-            capture_output=True,
-        )
+        """Check if the tmux session still exists.
+
+        Returns False if tmux is not installed, so the caller falls through to
+        create_session, which raises a clear TmuxError (EC-9 / AC-42) rather than
+        letting a FileNotFoundError traceback escape here.
+        """
+        try:
+            result = subprocess.run(
+                ["tmux", "has-session", "-t", self.session],
+                capture_output=True,
+            )
+        except FileNotFoundError:
+            return False
         return result.returncode == 0
 
-    def kill_session(self):
-        subprocess.run(
-            ["tmux", "kill-session", "-t", self.session],
-            capture_output=True,
+    def status_pane_busy(self):
+        """True if an orchestrator driver loop is running in the status pane.
+
+        Used by interactive reuse to tell "alive and actively being driven by an
+        in-tmux orchestrator the user detached from" (re-attach only, AC-18)
+        apart from "alive but idle at a shell prompt" (safe to drive a new step).
+        Detected via the status pane's foreground command: a python/ark process
+        there is the inner orchestrator; a bare shell is idle.
+        """
+        result = subprocess.run(
+            ["tmux", "list-panes", "-t", self.status_target,
+             "-F", "#{pane_current_command}"],
+            capture_output=True, text=True,
         )
+        if result.returncode != 0:
+            return False
+        cmd = result.stdout.strip().lower()
+        return any(tok in cmd for tok in ("python", "ark"))
+
+    def kill_session(self):
+        # Tolerate tmux being absent: reaping a session is best-effort, and the
+        # caller's subsequent create_session() raises the clear TmuxError for the
+        # tmux-unavailable case (EC-9 / AC-42).
+        try:
+            subprocess.run(
+                ["tmux", "kill-session", "-t", self.session],
+                capture_output=True,
+            )
+        except FileNotFoundError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -631,25 +767,23 @@ def run_in_tmux(
     work_dir = str(Path(sentinel).parent.parent)
     if not tmux.is_alive():
         tmux.create_session(work_dir)
-    tmux.send_command(cmd)
+    # Send the agent command to the AGENT pane (pane 0), where it runs as that
+    # pane's foreground process and renders its reasoning stream (AC-4, AC-5).
+    tmux.send_command(cmd, pane=AGENT_PANE)
     ok = tmux.wait_for_sentinel(sentinel, timeout=timeout)
     if ok:
-        # Kill the interactive claude session so the pane is ready for the next step
-        subprocess.run(
-            ["tmux", "send-keys", "-t", tmux.session, "/exit", "Enter"],
-            capture_output=True,
-        )
+        # End the interactive agent REPL so the agent pane is ready for the next
+        # step's agent (AC-13). Targets pane 0 only — the orchestrator in pane 1
+        # is untouched.
+        tmux.exit_agent_repl()
         time.sleep(2)
     if not ok and not tmux.is_alive():
         print("  [!] Retrying after tmux session loss", file=sys.stderr)
         tmux.create_session(work_dir)
-        tmux.send_command(cmd)
+        tmux.send_command(cmd, pane=AGENT_PANE)
         ok = tmux.wait_for_sentinel(sentinel, timeout=timeout)
         if ok:
-            subprocess.run(
-                ["tmux", "send-keys", "-t", tmux.session, "/exit", "Enter"],
-                capture_output=True,
-            )
+            tmux.exit_agent_repl()
             time.sleep(2)
     return ok
 
@@ -1082,8 +1216,53 @@ def step_introspect(tmux, project_dir, archive_dir, slug, outcome):
 # ---------------------------------------------------------------------------
 
 
+def _attach_target_is_tty():
+    """Interactivity is decided by the attach-target tty, NOT by stdin.
+
+    The attach target ark would hand to `tmux attach` is the controlling
+    terminal on stdout/stderr. A run is interactive iff one of those is a tty;
+    a piped/redirected stdin (the normal way the feature text is supplied) does
+    NOT make a run headless (AC-20b, FR-7).
+    """
+    return sys.stdout.isatty() or sys.stderr.isatty()
+
+
+def _launch_inner_orchestrator(tmux, project_dir, feature_slug, driver):
+    """Launch the orchestrator's driver loop INSIDE the status pane (pane 1).
+
+    Re-execs this same ark.py with ARK_INNER set so the driver loop and its
+    [step:...] progress run in pane 1 (FR-3), driving the agent in pane 0. The
+    feature, root, slug, and session are reconstructed by the inner process from
+    its environment and the worktree's .ark/ artifacts. ARK_RUNNING is NOT
+    exported here: the inner orchestrator is legitimate and sets the guard
+    itself, so only the agents it spawns are blocked from recursing.
+    """
+    ark_py = os.path.abspath(__file__)
+    env_prefix = (
+        f"ARK_INNER=1 "
+        f"ARK_SESSION={shlex.quote(tmux.session)} "
+        f"ARK_WORKDIR={shlex.quote(project_dir)} "
+        f"ARK_SLUG={shlex.quote(feature_slug)} "
+        f"ARK_DRIVER={shlex.quote(driver)}"
+    )
+    cmd = f"{env_prefix} {shlex.quote(sys.executable)} {shlex.quote(ark_py)} _inner"
+    tmux.send_command(cmd, pane=STATUS_PANE)
+
+
 def run_pipeline(feature, invocation_dir, driver="claude"):
-    """Execute the full ark pipeline.
+    """Set up the run's topology, then drive (or hand off) the pipeline.
+
+    This is the OUTER entry invoked by `ark new`/`ark continue`. It performs the
+    one-time setup (repo check, worktree, session), then:
+
+      - interactive (an attach-target tty exists): launches the orchestrator's
+        driver loop inside the status pane (pane 1) and attaches the user's
+        terminal to the two-pane session, agent pane primary (FR-5). Detaching
+        leaves that in-tmux orchestrator running (FR-6).
+      - headless (no attach-target tty): builds the same two-pane session but
+        drives the pipeline in THIS process without attaching (FR-7, AC-20a).
+
+    Exactly one orchestrator driver loop runs per run either way (AC-9).
 
     invocation_dir is where the user ran ark (inside the repo-root working tree).
     All file-modifying work happens in a per-run worktree, so artifacts, agent
@@ -1093,11 +1272,10 @@ def run_pipeline(feature, invocation_dir, driver="claude"):
     if os.environ.get("ARK_RUNNING"):
         print("Error: recursive ark invocation blocked", file=sys.stderr)
         sys.exit(1)
-    os.environ["ARK_RUNNING"] = "1"
 
     invocation_dir = os.path.abspath(invocation_dir)
 
-    # EC-1: must be inside a git repository before we touch anything.
+    # EC-1: must be inside a git repository before we touch anything (AC-30).
     try:
         root = repo_root(invocation_dir)
     except ArkError as e:
@@ -1131,7 +1309,7 @@ def run_pipeline(feature, invocation_dir, driver="claude"):
         print("           set ARK_SKIP_PERMISSIONS=0 to disable")
     print()
 
-    # Save driver choice for resume
+    # Save driver choice for resume (AC-25)
     driver_file = Path(project_dir) / ARK_DIR / "DRIVER"
     if not driver_file.exists():
         driver_file.write_text(driver)
@@ -1146,27 +1324,29 @@ def run_pipeline(feature, invocation_dir, driver="claude"):
     # Check resume point (based on artifacts in this worktree's .ark/) — AC-18.
     resume_after = detect_resume_point(feature_slug, project_dir)
 
-    # Session name is a deterministic function of the slug (AC-10), so
+    # Session name is a deterministic function of the slug (AC-27), so
     # concurrent runs with different slugs neither share nor kill each other's
     # session. If a session for THIS slug is already alive, a run for this slug
     # is in flight: don't destroy its agent state — refuse rather than clobber.
     tmux = Tmux(session_name)
+    already_driving = False
     if tmux.is_alive():
         # A live session is the NORMAL state once a run has started: each step
-        # launches claude in pane 0's shell and ends it with "/exit", which
-        # quits the claude REPL but leaves the pane shell running. So the
-        # session stays alive from creation until something kills it.
+        # launches the agent in pane 0's shell and ends it with "/exit", which
+        # quits the agent REPL but leaves the pane shell running. So the session
+        # stays alive from creation until something kills it.
         #
         # Distinguish the two reasons it can be alive here using the resume
         # point (derived from on-disk artifacts):
         #   1. No resume point -> no step has produced an artifact yet, so a
         #      run is genuinely in flight from the start (e.g. a second `ark
-        #      new` racing the first). Refuse, to avoid clobbering its agent.
+        #      new` racing the first). Refuse, to avoid clobbering its agent
+        #      (AC-28).
         #   2. A resume point exists -> the previous step completed (artifact on
         #      disk) and the session is just sitting at the pane shell (or an
-        #      interactive agent someone left open). Reuse it: send "/exit" to
-        #      drop any lingering claude REPL back to the shell, then proceed
-        #      with a fresh agent for the next step.
+        #      interactive agent someone left open). Reuse its two-pane layout
+        #      (AC-29): drop any lingering REPL in the agent pane back to its
+        #      shell, then proceed with a fresh agent for the next step.
         if resume_after is None:
             print(
                 f"Error: a run for this feature is already in flight "
@@ -1176,26 +1356,106 @@ def run_pipeline(feature, invocation_dir, driver="claude"):
                 file=sys.stderr,
             )
             return 1
-        print(
-            f"  Reusing live session '{session_name}' (idle after "
-            f"'{resume_after}'); clearing any open agent."
-        )
-        # No-op if the pane is already at a shell prompt ("/exit" is just an
-        # unknown command); ends the REPL if an interactive agent was left open.
-        subprocess.run(
-            ["tmux", "send-keys", "-t", session_name, "/exit", "Enter"],
-            capture_output=True,
-        )
-        time.sleep(2)
-        # Defensive: if "/exit" somehow took down the session, recreate it.
-        if not tmux.is_alive():
-            tmux.create_session(project_dir)
+        # If an orchestrator is already driving pane 1 (a detached-from
+        # interactive run), this is a pure re-attach: don't disturb the agent
+        # pane and don't launch a second driver (AC-9, AC-18).
+        already_driving = tmux.has_two_panes() and tmux.status_pane_busy()
+        if already_driving:
+            print(
+                f"  Re-attaching to live session '{session_name}' — an "
+                f"orchestrator is already driving in the status pane."
+            )
+        else:
+            print(
+                f"  Reusing live session '{session_name}' (idle after "
+                f"'{resume_after}'); clearing any open agent."
+            )
+            # No-op if the agent pane is already at a shell prompt ("/exit" is
+            # just an unknown command); ends the REPL if an interactive agent was
+            # left open. Targets pane 0 so anything in pane 1 stays untouched.
+            tmux.exit_agent_repl()
+            time.sleep(2)
+            # Defensive: a session reused from an older single-pane ark, or one
+            # whose split was lost, may lack the status pane. Rebuild it cleanly.
+            if not tmux.is_alive():
+                try:
+                    tmux.create_session(project_dir)
+                except TmuxError as e:
+                    print(f"Error: {e}", file=sys.stderr)
+                    return 1
+            elif not tmux.has_two_panes():
+                tmux.kill_session()
+                try:
+                    tmux.create_session(project_dir)
+                except TmuxError as e:
+                    print(f"Error: {e}", file=sys.stderr)
+                    return 1
     else:
         # Reap any dead/leftover registration for this name, then create fresh.
         tmux.kill_session()
-        tmux.create_session(project_dir)
+        try:
+            tmux.create_session(project_dir)
+        except TmuxError as e:
+            # EC-9 / AC-42: tmux unavailable or session creation failed — fail
+            # loudly rather than driving a pipeline against a session that does
+            # not exist.
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
 
     print(f"  Attach with: tmux attach -t {session_name}\n")
+
+    interactive = _attach_target_is_tty()
+
+    if interactive:
+        # FR-5/FR-6: the single orchestrator driver loop runs INSIDE the status
+        # pane (pane 1). Launch it there (unless one is already driving this
+        # reused session), then attach the user to the two-pane layout with the
+        # agent pane primary (AC-14). Detaching leaves the in-tmux orchestrator
+        # running (FR-6); this outer process just exits.
+        if not already_driving:
+            _launch_inner_orchestrator(tmux, project_dir, feature_slug, driver)
+        tmux.attach()
+        print(f"\n  Detached. The run continues in tmux session "
+              f"'{session_name}'.")
+        print(f"  Re-attach: ark continue {feature_slug}  "
+              f"(or tmux attach -t {session_name})")
+        print(f"  Branch ark/{feature_slug} will be ready to merge when the run "
+              f"finishes.")
+        return 0
+
+    # Headless (AC-20/AC-20a/AC-21): no attach-target tty.
+    if already_driving:
+        # An interactive orchestrator the user detached from is already driving
+        # this run inside pane 1. A headless `ark continue` must not start a
+        # second driver (AC-9) — report the live run and let it finish (AC-22).
+        print(f"  A run for '{feature_slug}' is already being driven in tmux "
+              f"session '{session_name}'; leaving it to finish.")
+        print(f"  Inspect: tmux attach -t {session_name}")
+        print(f"  Branch ark/{feature_slug} will be ready to merge when it "
+              f"finishes.")
+        return 0
+
+    # The two-pane session is already built; drive the pipeline in THIS process
+    # without ever attaching. This is the single orchestrator for a headless run.
+    return _drive_pipeline(
+        tmux, feature, root, project_dir, feature_slug, session_name,
+        driver, resume_after,
+    )
+
+
+def _drive_pipeline(tmux, feature, root, project_dir, feature_slug,
+                    session_name, driver, resume_after):
+    """The orchestrator driver loop: sequence steps, drive pane 0, poll sentinels.
+
+    Runs either inside the status pane (interactive, launched by
+    `_launch_inner_orchestrator`) or in the outer process (headless). Either way
+    this is the ONE driver loop for the run (AC-9). The two-pane session already
+    exists; this function only drives it.
+    """
+    # Block agents this orchestrator spawns from recursively invoking ark. Set
+    # here (not in the outer setup) so it covers both the in-tmux inner process
+    # and the headless in-process driver.
+    os.environ["ARK_RUNNING"] = "1"
 
     # Phase 1: Spec
     if resume_after is None:
@@ -1302,6 +1562,48 @@ def run_pipeline(feature, invocation_dir, driver="claude"):
     return 0
 
 
+def _run_inner_from_env():
+    """Reconstruct run state from ARK_* env vars and drive the pipeline.
+
+    Invoked as `ark _inner` inside the status pane (pane 1). The outer process
+    already created the two-pane session and the worktree; here we only rebuild
+    the small amount of state the driver loop needs and hand off to
+    `_drive_pipeline`. The feature text and resume point come from the worktree's
+    own .ark/ artifacts, so nothing fragile is passed on the command line.
+    """
+    session_name = os.environ.get("ARK_SESSION")
+    project_dir = os.environ.get("ARK_WORKDIR")
+    feature_slug = os.environ.get("ARK_SLUG")
+    driver = os.environ.get("ARK_DRIVER", "claude")
+    if not (session_name and project_dir and feature_slug):
+        print("Error: ark _inner is internal and requires ARK_SESSION, "
+              "ARK_WORKDIR, and ARK_SLUG", file=sys.stderr)
+        return 1
+
+    feature_file = Path(project_dir) / ARK_DIR / "FEATURE.md"
+    if not feature_file.exists():
+        print(f"Error: ark _inner: no FEATURE.md in {project_dir}",
+              file=sys.stderr)
+        return 1
+    feature = feature_file.read_text().strip()
+
+    try:
+        root = repo_root(project_dir)
+    except ArkError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    # Re-derive the resume point from on-disk artifacts so a launch into a
+    # partially complete run picks up where it left off (AC-18).
+    resume_after = detect_resume_point(feature_slug, project_dir)
+
+    tmux = Tmux(session_name)
+    return _drive_pipeline(
+        tmux, feature, root, project_dir, feature_slug, session_name,
+        driver, resume_after,
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1331,6 +1633,13 @@ def main():
     if cmd in ("help", "-h", "--help"):
         print_help(file=sys.stdout)
         sys.exit(0)
+
+    if cmd == "_inner":
+        # Internal entry: the orchestrator driver loop, launched by the outer
+        # process inside the status pane (pane 1) for interactive runs (FR-3).
+        # Not a user-facing command. All state is passed via the ARK_* env vars
+        # set by _launch_inner_orchestrator; the two-pane session already exists.
+        sys.exit(_run_inner_from_env())
 
     if cmd == "archive":
         label = sys.argv[2] if len(sys.argv) > 2 else None

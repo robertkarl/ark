@@ -75,8 +75,16 @@ lesson is two sentences: one observation, one proposed ~one-line fix.
   file edits, commits, `.ark/` artifacts, and verification happen there — the
   **repository-root working tree is never touched** (no stashing, no branch
   switching, uncommitted changes are left alone).
-- All agents run in a tmux session you can attach to: `tmux attach -t ark-<slug>`
-  (the session name is derived from the slug, so concurrent runs don't collide).
+- Each run is a two-pane tmux session: a large, focused **agent pane** (pane 0)
+  where the current step's agent runs front-and-center, and a small **status
+  pane** (pane 1) carrying the orchestrator's `[step:...]` progress. When you run
+  `ark new`/`ark continue` interactively, ark attaches you straight into that
+  session with the agent pane primary — the orchestrator now lives *inside* tmux,
+  so **detaching leaves the whole pipeline running**. Re-attach any time with
+  `ark continue <slug>` or `tmux attach -t ark-<slug>` (the session name is
+  derived from the slug, so concurrent runs don't collide). A headless run (no
+  attach-target terminal — CI, redirected output) drives the same two-pane
+  session without attaching.
 - Agents commit as they go on the `ark/<slug>` branch. When done, ark prints the
   worktree path and the `git merge ark/<slug>` command — the branch is visible
   and mergeable from the repository root via normal git, no merge required to see
