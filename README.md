@@ -43,11 +43,36 @@ Each agent gets fresh context. No state bleeds between steps. The Python script 
 
 ## How it works
 
-- All agents run in a tmux session you can attach to: `tmux attach -t ark-*`
-- Creates an `ark/<slug>` git branch for isolation
-- Agents commit as they go on the feature branch
-- Resumable: re-run the same command and it skips completed steps
-- Archives results to `.ark/archive/` after each run
+- Each run executes in its own [git worktree](https://git-scm.com/docs/git-worktree)
+  — a separate working directory linked to the same repository — so **multiple
+  runs can proceed in parallel on one repository** without fighting over the
+  working tree, branches, or `.ark/` artifacts.
+- The worktree is created at a deterministic path under
+  `.git/ark-worktrees/<slug>`, with the `ark/<slug>` branch checked out. All
+  file edits, commits, `.ark/` artifacts, and verification happen there — the
+  **repository-root working tree is never touched** (no stashing, no branch
+  switching, uncommitted changes are left alone).
+- All agents run in a tmux session you can attach to: `tmux attach -t ark-<slug>`
+  (the session name is derived from the slug, so concurrent runs don't collide).
+- Agents commit as they go on the `ark/<slug>` branch. When done, ark prints the
+  worktree path and the `git merge ark/<slug>` command — the branch is visible
+  and mergeable from the repository root via normal git, no merge required to see
+  the commits.
+- Resumable while in progress: re-run the same command (or `ark continue`) and
+  it reuses the existing worktree and branch, skipping completed steps based on
+  the artifacts in that worktree's `.ark/`. With several runs in flight,
+  disambiguate from the repository root with `ark continue <slug>`. (Archiving a
+  run ends it — see below.)
+- A run's worktree persists after the run finishes so its branch stays
+  inspectable and mergeable from the repository root. Stale registrations (a
+  worktree directory deleted out from under git) are detected and pruned
+  automatically on the next run for that slug, so they don't accumulate as
+  orphans. Remove a finished run's worktree yourself with
+  `git worktree remove .git/ark-worktrees/<slug>` once you've merged it.
+- `ark archive [label]` is **terminal**: it sweeps the whole run out of `.ark/`
+  into `.ark/archive/<timestamp>/`. An archived run is gone — it's no longer
+  discoverable by `ark continue` or resumable. Start a fresh run to revisit the
+  feature.
 
 ## Configuration
 

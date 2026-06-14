@@ -209,6 +209,10 @@ MODEL = _MODEL_RAW
 MAX_LOOPS = 3
 MAX_REVIEW_LOOPS = 3
 ARK_DIR = ".ark"
+# Worktrees live under .git/<WORKTREE_SUBDIR>/<slug>. This keeps them out of
+# the repository-root working tree (so they never show up as tracked or
+# untracked entries) while remaining deterministic and tied to the repo.
+WORKTREE_SUBDIR = "ark-worktrees"
 
 
 def _validate_model():
@@ -338,35 +342,221 @@ def ensure_dir(project_dir):
     return d
 
 
-def create_branch(slug):
-    """Create and checkout an ark/ branch. Stashes if dirty."""
-    # Check for dirty working tree
-    status = subprocess.run(
-        ["git", "status", "--porcelain"], capture_output=True, text=True,
-    )
-    stashed = False
-    if status.stdout.strip():
-        print("  Stashing uncommitted changes...")
-        subprocess.run(["git", "stash", "push", "-m", f"ark-{slug}-autostash"], check=True)
-        stashed = True
+class ArkError(Exception):
+    """A user-facing error that should abort the run with a clear message."""
 
+
+def _git(args, cwd=None, check=False):
+    """Run a git command, returning the CompletedProcess."""
+    return subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True, check=check,
+    )
+
+
+def repo_root(cwd=None):
+    """Return the absolute path of the repository-root working tree.
+
+    Raises ArkError if cwd is not inside a git repository (EC-1).
+    """
+    result = _git(["rev-parse", "--show-toplevel"], cwd=cwd)
+    if result.returncode != 0:
+        raise ArkError(
+            "not inside a git repository — ark needs a git repo to create "
+            "worktrees.\n  Run ark from inside a git working tree."
+        )
+    return result.stdout.strip()
+
+
+def git_common_dir(cwd=None):
+    """Return the absolute path of the shared .git directory for this repo.
+
+    Using the *common* dir (not the per-worktree git dir) means every worktree
+    resolves to the same base, so worktree paths are stable regardless of which
+    working tree ark is invoked from.
+    """
+    result = _git(["rev-parse", "--git-common-dir"], cwd=cwd)
+    if result.returncode != 0:
+        raise ArkError("not inside a git repository")
+    common = result.stdout.strip()
+    # --git-common-dir may be relative (e.g. ".git"); resolve against cwd.
+    base = Path(cwd) if cwd else Path.cwd()
+    return str((base / common).resolve())
+
+
+def worktree_path(slug, cwd=None):
+    """Deterministic worktree path for a slug (AC-40, EC-10).
+
+    Same slug -> same path; different slugs -> different paths. Lives under the
+    shared .git directory so it never appears in the repo-root working tree.
+    """
+    return str(Path(git_common_dir(cwd)) / WORKTREE_SUBDIR / slug)
+
+
+def _registered_worktrees(cwd=None):
+    """Parse `git worktree list --porcelain` into {abs_path: branch_or_None}."""
+    result = _git(["worktree", "list", "--porcelain"], cwd=cwd)
+    trees = {}
+    cur_path = None
+    cur_branch = None
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            cur_path = line[len("worktree "):]
+            cur_branch = None
+        elif line.startswith("branch "):
+            ref = line[len("branch "):]
+            # refs/heads/ark/<slug> -> ark/<slug>
+            cur_branch = ref.replace("refs/heads/", "", 1)
+        elif line == "" and cur_path is not None:
+            trees[str(Path(cur_path).resolve())] = cur_branch
+            cur_path = None
+    if cur_path is not None:
+        trees[str(Path(cur_path).resolve())] = cur_branch
+    return trees
+
+
+def _branch_exists(branch, cwd=None):
+    return _git(["rev-parse", "--verify", "--quiet", branch], cwd=cwd).returncode == 0
+
+
+def _is_ark_worktree_path(path, cwd=None):
+    """True if `path` lives under the ark-managed worktree base.
+
+    Used to distinguish ark's own run worktrees from the repository-root
+    working tree (and any user-created worktrees), which must never be treated
+    as a reusable run worktree.
+    """
+    base = str(Path(git_common_dir(cwd)) / WORKTREE_SUBDIR)
+    resolved = str(Path(path).resolve())
+    return resolved == base or resolved.startswith(base + os.sep)
+
+
+def _branch_checked_out_at(branch, cwd=None):
+    """Return the ark-managed worktree path where `branch` is checked out.
+
+    Only ark's own run worktrees are considered: the repository-root working
+    tree (and any user worktree) is excluded, so a run branch that happens to
+    be checked out in the repo root never masquerades as a reusable worktree.
+    """
+    for path, br in _registered_worktrees(cwd).items():
+        if br == branch and _is_ark_worktree_path(path, cwd=cwd):
+            return path
+    return None
+
+
+def setup_worktree(slug, root):
+    """Create or reuse a dedicated worktree for this run's slug.
+
+    Returns the absolute path to the worktree. Handles the worktree edge cases:
+      EC-3  path exists       -> reuse if valid for this slug, else error
+      EC-4  branch exists     -> check it out (preserve history)
+      EC-5  branch elsewhere  -> reuse that worktree, or error
+      EC-6  stale registration-> prune and recreate
+
+    Raises ArkError on unrecoverable problems (EC-2, EC-3 conflict).
+    """
     branch = f"ark/{slug}"
-    result = subprocess.run(
-        ["git", "rev-parse", "--verify", branch], capture_output=True,
-    )
-    if result.returncode == 0:
-        subprocess.run(["git", "checkout", branch], check=True)
-    else:
-        subprocess.run(["git", "checkout", "-b", branch], check=True)
+    wt = worktree_path(slug, cwd=root)
+    wt_resolved = str(Path(wt).resolve())
 
-    if stashed:
-        pop = subprocess.run(["git", "stash", "pop"], capture_output=True, text=True)
-        if pop.returncode != 0:
-            print("  [!] git stash pop failed — your changes are still in the stash.",
-                  file=sys.stderr)
-            print(f"      {pop.stderr.strip()}", file=sys.stderr)
-            print("      Run 'git stash list' and 'git stash pop' manually to recover.",
-                  file=sys.stderr)
+    registered = _registered_worktrees(cwd=root)
+    reg_branch = registered.get(wt_resolved)
+    on_disk = Path(wt).is_dir()
+
+    # EC-6: stale registration — registered but directory is gone. Prune it.
+    if wt_resolved in registered and not on_disk:
+        print("  Pruning stale worktree registration...")
+        _git(["worktree", "prune"], cwd=root)
+        registered = _registered_worktrees(cwd=root)
+        reg_branch = registered.get(wt_resolved)
+
+    # EC-3 / AC-32: path already a valid worktree for THIS run -> reuse.
+    if wt_resolved in registered and Path(wt).is_dir() and reg_branch == branch:
+        print(f"  Reusing existing worktree: {wt}")
+        return wt
+
+    # EC-3 / AC-33: registered at our path but with the wrong branch -> error
+    # rather than silently corrupting it.
+    if wt_resolved in registered and reg_branch != branch:
+        raise ArkError(
+            f"worktree path already exists but has '{reg_branch}' checked out, "
+            f"not '{branch}':\n  {wt}\n  Resolve manually "
+            f"(git worktree remove) before retrying."
+        )
+
+    # EC-5: the branch is checked out in some OTHER worktree.
+    other = _branch_checked_out_at(branch, cwd=root)
+    if other is not None and str(Path(other).resolve()) != wt_resolved:
+        if Path(other).is_dir():
+            print(f"  Reusing existing worktree for {branch}: {other}")
+            return other
+        # Registered elsewhere but missing on disk -> prune and continue.
+        print("  Pruning stale worktree for this branch...")
+        _git(["worktree", "prune"], cwd=root)
+
+    # EC-5 (AC-35): the branch is checked out somewhere git won't let us reuse
+    # as a run worktree — e.g. the repository root. Report a clear, actionable
+    # error instead of letting `worktree add` fail with a cryptic message or,
+    # worse, mutating the repo root.
+    non_ark = None
+    for path, br in _registered_worktrees(cwd=root).items():
+        if br == branch and not _is_ark_worktree_path(path, cwd=root):
+            non_ark = path
+            break
+    if non_ark is not None:
+        raise ArkError(
+            f"branch '{branch}' is already checked out outside an ark "
+            f"worktree:\n  {non_ark}\n  Check out a different branch there "
+            f"(e.g. `git -C {non_ark} switch -`) before starting this run."
+        )
+
+    # EC-3 (AC-33): a non-worktree directory squats our path -> error.
+    if Path(wt).exists():
+        raise ArkError(
+            f"intended worktree path already exists and is not a valid ark "
+            f"worktree:\n  {wt}\n  Remove it or choose a different slug."
+        )
+
+    # Create the worktree, checking out the branch (EC-4: existing branch is
+    # reused with its history; otherwise a new branch is created).
+    Path(wt).parent.mkdir(parents=True, exist_ok=True)
+    if _branch_exists(branch, cwd=root):
+        add = _git(["worktree", "add", wt, branch], cwd=root)
+    else:
+        add = _git(["worktree", "add", "-b", branch, wt], cwd=root)
+
+    if add.returncode != 0:
+        # EC-2: worktree creation failed (git error, permission denied, etc.)
+        raise ArkError(
+            f"failed to create worktree at {wt}:\n  {add.stderr.strip()}"
+        )
+
+    print(f"  Created worktree: {wt}")
+    return wt
+
+
+def remove_worktree(slug, root):
+    """Remove a run's worktree and prune stale registrations (AC-21)."""
+    wt = worktree_path(slug, cwd=root)
+    if Path(wt).exists():
+        _git(["worktree", "remove", "--force", wt], cwd=root)
+    _git(["worktree", "prune"], cwd=root)
+
+
+def find_ark_worktrees(root):
+    """Return ark run worktrees that have a .ark/FEATURE.md (in-progress runs).
+
+    Returns a list of (slug, path) for worktrees living under the deterministic
+    ark worktree base. Used by `ark continue`/`ark archive` to locate a run's
+    artifacts from the repository root without knowing the worktree path.
+    """
+    base = str(Path(git_common_dir(cwd=root)) / WORKTREE_SUBDIR)
+    found = []
+    for path in _registered_worktrees(cwd=root):
+        if not (path == base or path.startswith(base + os.sep)):
+            continue
+        if (Path(path) / ARK_DIR / "FEATURE.md").exists():
+            found.append((Path(path).name, path))
+    return sorted(found)
 
 
 def make_sentinel(project_dir):
@@ -380,11 +570,13 @@ def run_in_tmux(
 
     The agent is instructed (via PROMPT_SENTINEL in its prompt) to create the
     sentinel file when finished. If the tmux session dies, recreates and retries.
+
+    The session's working directory is the run's worktree: the sentinel lives in
+    <worktree>/.ark/, so the worktree is sentinel.parent.parent (AC-5).
     """
-    # sentinel is inside project_dir/.ark/ — go up two levels
-    project_dir = str(Path(sentinel).parent.parent)
+    work_dir = str(Path(sentinel).parent.parent)
     if not tmux.is_alive():
-        tmux.create_session(project_dir)
+        tmux.create_session(work_dir)
     tmux.send_command(cmd)
     ok = tmux.wait_for_sentinel(sentinel, timeout=timeout)
     if ok:
@@ -396,7 +588,7 @@ def run_in_tmux(
         time.sleep(2)
     if not ok and not tmux.is_alive():
         print("  [!] Retrying after tmux session loss", file=sys.stderr)
-        tmux.create_session(project_dir)
+        tmux.create_session(work_dir)
         tmux.send_command(cmd)
         ok = tmux.wait_for_sentinel(sentinel, timeout=timeout)
         if ok:
@@ -683,17 +875,13 @@ def detect_resume_point(feature_slug, project_dir):
 # ---------------------------------------------------------------------------
 
 
-def migrate_kisskorc(project_dir):
-    """Migrate .kisskorc/ artifacts to .ark/ if needed."""
-    old_dir = Path(project_dir) / ".kisskorc"
-    new_dir = Path(project_dir) / ARK_DIR
-    if old_dir.exists() and not new_dir.exists():
-        print("  Migrating .kisskorc/ -> .ark/...")
-        shutil.copytree(str(old_dir), str(new_dir))
-
-
 def archive_run(project_dir, label=None):
-    """Move .ark/ artifacts to .ark/archive/<timestamp>/."""
+    """Move every .ark/ artifact into .ark/archive/<timestamp>/.
+
+    Archiving is terminal: it sweeps the whole run out of .ark/ so the run is no
+    longer discoverable or resumable. An archived run is gone — start a fresh run
+    if you want to revisit the feature.
+    """
     ark_dir = Path(project_dir) / ARK_DIR
     if not ark_dir.exists():
         print("Nothing to archive — no .ark/ directory", file=sys.stderr)
@@ -708,12 +896,13 @@ def archive_run(project_dir, label=None):
     archive_dir = ark_dir / "archive" / archive_name
     archive_dir.mkdir(parents=True, exist_ok=True)
 
-    # Move all artifacts out of .ark/ (skip the archive directory itself)
+    # Move all artifacts out of .ark/ (skip the archive directory itself).
     for f in ark_dir.iterdir():
         if f.name == "archive":
             continue
-        if f.is_file():
-            shutil.move(str(f), str(archive_dir / f.name))
+        if not f.is_file():
+            continue
+        shutil.move(str(f), str(archive_dir / f.name))
 
     print(f"  Archived to {archive_dir}")
     return archive_dir
@@ -724,23 +913,50 @@ def archive_run(project_dir, label=None):
 # ---------------------------------------------------------------------------
 
 
-def run_pipeline(feature, project_dir, driver="claude"):
-    """Execute the full ark pipeline."""
+def run_pipeline(feature, invocation_dir, driver="claude"):
+    """Execute the full ark pipeline.
+
+    invocation_dir is where the user ran ark (inside the repo-root working tree).
+    All file-modifying work happens in a per-run worktree, so artifacts, agent
+    commands, and verification all use the worktree as their working directory —
+    the repository-root working tree is never disturbed.
+    """
     if os.environ.get("ARK_RUNNING"):
         print("Error: recursive ark invocation blocked", file=sys.stderr)
         sys.exit(1)
     os.environ["ARK_RUNNING"] = "1"
 
-    project_dir = os.path.abspath(project_dir)
-    korc_dir = ensure_dir(project_dir)
+    invocation_dir = os.path.abspath(invocation_dir)
+
+    # EC-1: must be inside a git repository before we touch anything.
+    try:
+        root = repo_root(invocation_dir)
+    except ArkError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
     feature_slug = slugify(feature)
     session_name = f"ark-{feature_slug}"
 
+    # EC-2..EC-6: create or reuse the run's dedicated worktree.
+    try:
+        work_dir = setup_worktree(feature_slug, root)
+    except ArkError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    # From here on, project_dir == the worktree. Artifacts, agents, and make all
+    # operate against the worktree (AC-5, AC-5b, AC-9).
+    project_dir = work_dir
+    korc_dir = ensure_dir(project_dir)
+
     print(f"ark: {feature_slug}")
-    print(f"  project: {project_dir}")
+    print(f"  repo root: {root}")
+    print(f"  worktree:  {project_dir}")
     print(f"  artifacts: {korc_dir}")
-    print(f"  tmux: {session_name}")
-    print(f"  driver: {driver}")
+    print(f"  branch:    ark/{feature_slug}")
+    print(f"  tmux:      {session_name}")
+    print(f"  driver:    {driver}")
     if SKIP_PERMISSIONS:
         print("  WARNING: agents run with --dangerously-skip-permissions")
         print("           set ARK_SKIP_PERMISSIONS=0 to disable")
@@ -758,14 +974,24 @@ def run_pipeline(feature, project_dir, driver="claude"):
     if not feature_file.exists():
         feature_file.write_text(feature)
 
-    # Create branch
-    create_branch(feature_slug)
-
-    # Check resume point
+    # Check resume point (based on artifacts in this worktree's .ark/) — AC-18.
     resume_after = detect_resume_point(feature_slug, project_dir)
 
-    # Create tmux session (kill old one if exists)
+    # Session name is a deterministic function of the slug (AC-10), so
+    # concurrent runs with different slugs neither share nor kill each other's
+    # session. If a session for THIS slug is already alive, a run for this slug
+    # is in flight: don't destroy its agent state — refuse rather than clobber.
     tmux = Tmux(session_name)
+    if tmux.is_alive():
+        print(
+            f"Error: a run for this feature is already in flight "
+            f"(tmux session '{session_name}' is alive).\n"
+            f"  Attach with: tmux attach -t {session_name}\n"
+            f"  Or kill it first: tmux kill-session -t {session_name}",
+            file=sys.stderr,
+        )
+        return 1
+    # Reap any dead/leftover registration for this name, then create fresh.
     tmux.kill_session()
     tmux.create_session(project_dir)
 
@@ -848,7 +1074,12 @@ def run_pipeline(feature, project_dir, driver="claude"):
     # Archive results
     archive_run(project_dir, feature_slug)
 
+    # FR-6: results are discoverable from the repository root via the branch.
     print(f"\n  Done. Branch ark/{feature_slug} is ready to merge.")
+    print(f"  Worktree: {project_dir}")
+    print(f"  From the repo root ({root}):")
+    print(f"    git merge ark/{feature_slug}")
+    print(f"  Inspect the run: tmux attach -t {session_name}")
     return 0
 
 
@@ -865,7 +1096,7 @@ ark — a dumb Python orchestrator for LLM agents.
 Usage:
   ark new 'Add auth' [--driver claude|codex]
   echo 'Add auth' | ark new [--driver claude|codex]
-  ark continue
+  ark continue [slug]
   ark archive [label]
   ark help"""
     print(msg, file=file)
@@ -884,20 +1115,75 @@ def main():
 
     if cmd == "archive":
         label = sys.argv[2] if len(sys.argv) > 2 else None
-        archive_run(os.getcwd(), label)
+        invocation_dir = os.getcwd()
+
+        # Locate the run worktree so archiving operates on the correct .ark/
+        # (AC-22). If ark is run from inside a worktree itself, that worktree's
+        # local .ark/ is used directly.
+        if (Path(invocation_dir) / ARK_DIR).exists():
+            archive_run(invocation_dir, label)
+            return
+        try:
+            root = repo_root(invocation_dir)
+            runs = find_ark_worktrees(root)
+        except ArkError:
+            runs = []
+        if not runs:
+            print("Nothing to archive — no .ark/ directory", file=sys.stderr)
+            return
+        if len(runs) > 1:
+            print("Multiple ark runs found; cd into the worktree you want to "
+                  "archive:", file=sys.stderr)
+            for slug, path in runs:
+                print(f"  {slug}  ({path})", file=sys.stderr)
+            return
+        archive_run(runs[0][1], label)
         return
 
     if cmd == "continue":
-        project_dir = os.getcwd()
-        migrate_kisskorc(project_dir)
-        feature_file = Path(project_dir) / ARK_DIR / "FEATURE.md"
-        if not feature_file.exists():
-            print("Error: no .ark/FEATURE.md — nothing to continue", file=sys.stderr)
+        invocation_dir = os.getcwd()
+        try:
+            root = repo_root(invocation_dir)
+        except ArkError as e:
+            print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
-        feature = feature_file.read_text().strip()
-        driver_file = Path(project_dir) / ARK_DIR / "DRIVER"
+
+        # Optional slug selects a specific run when several are in flight — the
+        # normal case under the parallel-run model, where bare `continue` can't
+        # know which worktree the user means.
+        want_slug = sys.argv[2] if len(sys.argv) > 2 else None
+
+        # Discover the run worktree(s) created by ark.
+        runs = find_ark_worktrees(root)
+        if not runs:
+            print("Error: no in-progress ark run found — nothing to continue",
+                  file=sys.stderr)
+            sys.exit(1)
+        if want_slug is not None:
+            match = [(s, p) for s, p in runs if s == want_slug]
+            if not match:
+                print(f"Error: no in-progress ark run for slug '{want_slug}'.",
+                      file=sys.stderr)
+                for slug, path in runs:
+                    print(f"  {slug}  ({path})", file=sys.stderr)
+                sys.exit(1)
+            run_dir = match[0][1]
+        elif len(runs) > 1:
+            print("Error: multiple in-progress ark runs found; "
+                  "pick one with `ark continue <slug>`:",
+                  file=sys.stderr)
+            for slug, path in runs:
+                print(f"  {slug}  ({path})", file=sys.stderr)
+            sys.exit(1)
+        else:
+            run_dir = runs[0][1]
+
+        feature = (Path(run_dir) / ARK_DIR / "FEATURE.md").read_text().strip()
+        driver_file = Path(run_dir) / ARK_DIR / "DRIVER"
         driver = driver_file.read_text().strip() if driver_file.exists() else "claude"
-        sys.exit(run_pipeline(feature, project_dir, driver=driver))
+        # run_pipeline re-derives the slug from the feature and reuses the
+        # existing worktree/branch (AC-16, AC-17).
+        sys.exit(run_pipeline(feature, invocation_dir, driver=driver))
 
     if cmd == "new":
         # Parse --driver flag and optional positional argument
