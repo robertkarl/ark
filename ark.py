@@ -488,18 +488,75 @@ class Tmux:
         Used by interactive reuse to tell "alive and actively being driven by an
         in-tmux orchestrator the user detached from" (re-attach only, AC-18)
         apart from "alive but idle at a shell prompt" (safe to drive a new step).
-        Detected via the status pane's foreground command: a python/ark process
-        there is the inner orchestrator; a bare shell is idle.
+
+        The inner orchestrator is a long-lived python process living in the
+        status pane's process subtree. Checking only the pane's *foreground*
+        command (`#{pane_current_command}`) is not enough: during non-agent
+        steps the orchestrator runs `make`/`codex`/etc. as child subprocesses
+        in this same pane (e.g. step_verify's `subprocess.run(["make", ...])`),
+        so the foreground command is `make`, not `python`, even though the
+        orchestrator is very much still driving. That false negative would let
+        `ark continue` launch a SECOND orchestrator over the live one (AC-9).
+        So walk the whole subtree under the pane's shell PID and treat the pane
+        as busy if any descendant is the inner ark orchestrator (a python
+        process running ark.py).
         """
         result = subprocess.run(
             ["tmux", "list-panes", "-t", self.status_target,
-             "-F", "#{pane_current_command}"],
+             "-F", "#{pane_pid}"],
             capture_output=True, text=True,
         )
         if result.returncode != 0:
             return False
-        cmd = result.stdout.strip().lower()
-        return any(tok in cmd for tok in ("python", "ark"))
+        pane_pid = result.stdout.strip().split("\n")[0] if result.stdout.strip() else None
+        if not pane_pid:
+            return False
+        return self._subtree_has_orchestrator(pane_pid)
+
+    @staticmethod
+    def _subtree_has_orchestrator(root_pid):
+        """True if root_pid or any descendant is the inner ark orchestrator.
+
+        Builds the parent->children map from `ps` once, then BFS the subtree
+        rooted at the pane shell, matching processes whose command line names a
+        python running ark.py (the inner driver) — robustly recognizing the
+        orchestrator even when it is currently blocked in a `make`/`codex`
+        child during a non-agent step.
+        """
+        ps = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,command="],
+            capture_output=True, text=True,
+        )
+        if ps.returncode != 0:
+            return False
+        children = {}
+        cmd_by_pid = {}
+        for line in ps.stdout.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) < 3:
+                continue
+            pid, ppid, cmd = parts[0], parts[1], parts[2]
+            children.setdefault(ppid, []).append(pid)
+            cmd_by_pid[pid] = cmd.lower()
+
+        def is_orchestrator(cmd):
+            # The inner driver is launched as `python .../ark.py _inner`
+            # (see _launch_inner_orchestrator). Require the `_inner` subcommand
+            # too so an incidental mention of ark.py in some other command line
+            # cannot be mistaken for the orchestrator.
+            return "ark.py" in cmd and "_inner" in cmd
+
+        stack = [str(root_pid)]
+        seen = set()
+        while stack:
+            pid = stack.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            if is_orchestrator(cmd_by_pid.get(pid, "")):
+                return True
+            stack.extend(children.get(pid, []))
+        return False
 
     def kill_session(self):
         # Tolerate tmux being absent: reaping a session is best-effort, and the
