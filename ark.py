@@ -1023,16 +1023,21 @@ def step_introspect(tmux, project_dir, archive_dir, slug, outcome):
     modification to either location (AC-17, AC-23).
     """
     print("[step:introspect] Reflecting on the run...")
+    # Track the live .ark/ scratch files we create so we can sweep them out
+    # afterwards. The archive step already swept the run's artifacts into the
+    # archive directory, so introspection must not leave new files behind in the
+    # live .ark/ — its only durable writes are the global lessons file and the
+    # run-local copy inside the archive directory (AC-30).
+    sentinel = make_sentinel(project_dir)
+    scratch_path = Path(project_dir) / ARK_DIR / "_introspect_lessons.md"
+    prompt_path = Path(project_dir) / ARK_DIR / "_prompt_introspect.md"
     try:
         # The introspection agent writes lessons (if any) to a scratch file in
         # the live .ark/ — NOT directly into the archive — so we control the
         # dual write and the "zero lessons => no file" semantics ourselves.
-        scratch_name = "_introspect_lessons.md"
-        scratch_path = Path(project_dir) / ARK_DIR / scratch_name
         if scratch_path.exists():
             scratch_path.unlink()
 
-        sentinel = make_sentinel(project_dir)
         prompt = PROMPT_INTROSPECT.format(
             outcome=outcome,
             archive_dir=str(archive_dir),
@@ -1062,6 +1067,14 @@ def step_introspect(tmux, project_dir, archive_dir, slug, outcome):
         print(f"  -> run-local copy at {run_local}")
     except Exception as e:  # best-effort: never let introspection break the run
         print(f"  [!] introspection failed (ignored): {e}", file=sys.stderr)
+    finally:
+        # Sweep introspection's own scratch/prompt/sentinel files out of the
+        # live .ark/ so a terminal run leaves no leftover artifacts there (AC-30).
+        for leftover in (scratch_path, prompt_path, Path(sentinel)):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
