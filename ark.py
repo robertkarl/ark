@@ -181,17 +181,22 @@ Severity tiers:
 Every finding must cite file:line. Confidence threshold: 80%.
 """
 
-PROMPT_LAND = """\
-You are a landing agent. Two code reviewers examined this codebase. \
-Their findings are at {claude_review_path} and {codex_review_path}.
+PROMPT_FIX_REVIEW = """\
+You are an implementer addressing code review feedback. Two code reviewers \
+examined this codebase. Their findings are at {claude_review_path} and \
+{codex_review_path}.
+
 Address every BLOCK finding. Address WARN findings if straightforward. Ignore NOTEs.
+
+Do not reimplement the whole feature. Make targeted fixes to address the \
+specific findings only.
+
+Read the spec at {spec_path} for context on what was intended.
 
 Rules:
 - Do not modify anything under .ark/
 - Do not merge branches. Do not run git merge. Commit on the current branch only.
 - Do not push to any remote.
-
-Read the spec at {spec_path} for context.
 """
 
 # ---------------------------------------------------------------------------
@@ -202,6 +207,7 @@ _MODEL_RAW = os.environ.get("ARK_MODEL", "opus")
 _MODEL_VALIDATED = False
 MODEL = _MODEL_RAW
 MAX_LOOPS = 3
+MAX_REVIEW_LOOPS = 3
 ARK_DIR = ".ark"
 
 
@@ -576,25 +582,33 @@ def step_reimplement(
 
 
 def step_adversarial(
-        tmux, project_dir):
-    """Spawn two adversarial reviewers sequentially."""
-    print("[step:adversarial] Adversarial review...")
+        tmux, project_dir, iteration=1):
+    """Spawn two adversarial reviewers sequentially.
+
+    Returns True if BLOCK or WARN findings were detected, False otherwise.
+    Output files are named adversarial-claude-{iteration}.md and
+    adversarial-codex-{iteration}.md.
+    """
+    print(f"[step:adversarial] Adversarial review (iteration {iteration})...")
+
+    claude_name = f"adversarial-claude-{iteration}.md"
+    codex_name = f"adversarial-codex-{iteration}.md"
 
     # Claude review
     sentinel = make_sentinel(project_dir)
     claude_prompt = PROMPT_ADVERSARIAL.format(
         spec_path=kp(project_dir, "SPEC.md"),
-        output_path=kp(project_dir, "adversarial-claude.md"),
+        output_path=kp(project_dir, claude_name),
     ) + PROMPT_SENTINEL.format(sentinel_path=sentinel)
     pf = write_prompt(project_dir, "adversarial-claude", claude_prompt)
     run_in_tmux(tmux, claude_cmd(pf), sentinel)
-    print("  -> adversarial-claude.md")
+    print(f"  -> {claude_name}")
 
     # Codex review (codex exits on its own, so use bash touch for sentinel)
     sentinel = make_sentinel(project_dir)
     codex_prompt = PROMPT_ADVERSARIAL.format(
         spec_path=kp(project_dir, "SPEC.md"),
-        output_path=kp(project_dir, "adversarial-codex.md"),
+        output_path=kp(project_dir, codex_name),
     )
     pf = write_prompt(project_dir, "adversarial-codex", codex_prompt)
     codex_cmd_str = (
@@ -603,10 +617,10 @@ def step_adversarial(
         f"touch {shlex.quote(sentinel)}"
     )
     run_in_tmux(tmux, codex_cmd_str, sentinel)
-    print("  -> adversarial-codex.md")
+    print(f"  -> {codex_name}")
 
     # Check for BLOCK/WARN findings or missing review files (agent failure)
-    for name in ["adversarial-claude.md", "adversarial-codex.md"]:
+    for name in [claude_name, codex_name]:
         p = Path(project_dir) / ARK_DIR / name
         if not p.exists():
             print(f"  [!] {name} missing — treating as findings present", file=sys.stderr)
@@ -617,19 +631,26 @@ def step_adversarial(
     return False
 
 
-def step_land(
-        tmux, project_dir):
-    """Fresh agent addresses adversarial findings. Interactive."""
-    print("[step:land] Addressing adversarial findings...")
+def step_fix_review(
+        tmux, project_dir, iteration=1, driver="claude"):
+    """Fresh agent addresses adversarial findings from a specific iteration.
+
+    Returns True if the fix agent completed successfully, False on failure.
+    """
+    print(f"[step:fix-review] Addressing findings from iteration {iteration} (driver={driver})...")
     sentinel = make_sentinel(project_dir)
-    prompt = PROMPT_LAND.format(
+    prompt = PROMPT_FIX_REVIEW.format(
         spec_path=kp(project_dir, "SPEC.md"),
-        claude_review_path=kp(project_dir, "adversarial-claude.md"),
-        codex_review_path=kp(project_dir, "adversarial-codex.md"),
+        claude_review_path=kp(project_dir, f"adversarial-claude-{iteration}.md"),
+        codex_review_path=kp(project_dir, f"adversarial-codex-{iteration}.md"),
     ) + PROMPT_SENTINEL.format(sentinel_path=sentinel)
-    pf = write_prompt(project_dir, "land", prompt)
-    run_in_tmux(tmux, claude_cmd(pf), sentinel)
-    print("  -> landing complete")
+    pf = write_prompt(project_dir, "fix-review", prompt)
+    ok = run_in_tmux(tmux, driver_cmd(pf, project_dir, driver), sentinel)
+    if ok:
+        print("  -> fix complete")
+    else:
+        print("  [!] fix agent failed", file=sys.stderr)
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -794,12 +815,35 @@ def run_pipeline(feature, project_dir, driver="claude"):
         archive_run(project_dir, feature_slug)
         return 1
 
-    # Phase 4: Adversarial review
-    has_findings = step_adversarial(tmux, project_dir)
+    # Phase 4: Review-fix loop
+    review_pass = False
 
-    # Phase 5: Land — address BLOCK/WARN findings
-    if has_findings:
-        step_land(tmux, project_dir)
+    if MAX_REVIEW_LOOPS == 0:
+        # EC-4: Run review once, report findings, but never spawn a fix agent.
+        has_findings = step_adversarial(tmux, project_dir, iteration=1)
+        review_pass = not has_findings
+    else:
+        for iteration in range(1, MAX_REVIEW_LOOPS + 1):
+            print(f"\n--- Review-fix iteration {iteration}/{MAX_REVIEW_LOOPS} ---\n")
+
+            has_findings = step_adversarial(tmux, project_dir, iteration=iteration)
+            if not has_findings:
+                review_pass = True
+                print("\n  No findings — review passed!")
+                break
+
+            if iteration == MAX_REVIEW_LOOPS:
+                break
+
+            ok = step_fix_review(tmux, project_dir, iteration=iteration, driver=driver)
+            if not ok:
+                print("\n  Fix agent failed — aborting review loop.", file=sys.stderr)
+                break
+
+    if not review_pass:
+        print(f"\n  Review-fix loop exhausted after {MAX_REVIEW_LOOPS} iterations")
+        archive_run(project_dir, feature_slug)
+        return 1
 
     # Archive results
     archive_run(project_dir, feature_slug)

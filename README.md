@@ -17,7 +17,6 @@ Requires: `python3`, `tmux`, `claude` (Claude Code CLI), `codex` (optional, for 
 ```
 echo 'Add a health check endpoint' | ark new
 echo 'Add a health check endpoint' | ark new --driver codex
-echo 'What does this project do?' | ark ask
 ark archive my-label
 ark help
 ```
