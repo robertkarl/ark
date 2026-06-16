@@ -111,6 +111,19 @@ lesson is two sentences: one observation, one proposed ~one-line fix.
 |---------|---------|-------------|
 | `ARK_MODEL` | `opus` | Model for all claude invocations |
 | `ARK_SKIP_PERMISSIONS` | `1` | Set to `0` to remove `--dangerously-skip-permissions` |
+| `ARK_IDLE_TIMEOUT` | `900` | Seconds a step may make **no progress** (no change to watched output) before it is declared hung. A step that keeps writing output is never killed. |
+| `ARK_STEP_TIMEOUT` | `86400` | Absolute wall-clock ceiling per step, regardless of progress — a final backstop (24h). |
+
+ark watches each run's worktree output area (`results/` and the worktree
+generally) while an implement/reimplement step runs. As long as that output
+keeps advancing, the step is considered alive and is never killed mid-write — a
+multi-hour job that steadily appends to an append-only file survives up to the
+hard ceiling. A step is timed out only when it makes no progress for
+`ARK_IDLE_TIMEOUT` seconds (or hits `ARK_STEP_TIMEOUT`). A timed-out step is
+reported as an explicit **timeout** — it never advances to verification and
+never renders a PASS/FAIL verdict against partial state. Both env vars must be
+positive integers; a non-numeric or non-positive value makes ark fail fast at
+startup naming the offending variable.
 
 ## Design principles
 

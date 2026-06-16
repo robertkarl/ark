@@ -263,6 +263,16 @@ GLOBAL_LESSONS_FILE = Path("~/.ark/LESSONS.md").expanduser()
 # Run-local copy of lessons, written into the archive directory alongside the
 # archived SPEC.md and other artifacts (AC-21).
 RUN_LESSONS_FILENAME = "LESSONS.md"
+
+# Default values for the legacy / fallback wall-clock cap. Preserved at 1800s so
+# a no-probe caller of wait_for_sentinel behaves exactly as it did before the
+# progress-aware fix (FR-5, AC-16).
+DEFAULT_WALLCLOCK_TIMEOUT = 1800
+
+# Documented defaults for the new progress-aware tunables (FR-10).
+DEFAULT_IDLE_TIMEOUT = 900       # 15 minutes
+DEFAULT_STEP_TIMEOUT = 86400     # 24 hours
+
 # Worktrees live under .git/<WORKTREE_SUBDIR>/<slug>. This keeps them out of
 # the repository-root working tree (so they never show up as tracked or
 # untracked entries) while remaining deterministic and tied to the repo.
@@ -286,6 +296,177 @@ def _validate_model():
         )
         sys.exit(1)
     _MODEL_VALIDATED = True
+
+
+def _read_positive_int_env(name, default):
+    """Read a positive-integer env var, failing fast on a bad value (EC-6).
+
+    Mirrors the fail-fast posture of _validate_model: a misconfigured timeout
+    must NOT silently degrade into an instant (zero) timeout that kills a live
+    job, and must NOT silently fall back to a default (silent fallback hides
+    operator typos). A non-numeric or non-positive value aborts with a clear
+    message naming the offending variable and its value.
+
+    Returns the parsed int when the variable is unset (the documented default)
+    or set to a valid positive integer.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        raise ArkError(
+            f"{name} must be a positive integer (seconds), got {raw!r}.\n"
+            f"  Unset it to use the default ({default}) or set a positive integer."
+        )
+    if value <= 0:
+        raise ArkError(
+            f"{name} must be a positive integer (seconds), got {raw!r}.\n"
+            f"  A zero/negative timeout would instantly kill live jobs. "
+            f"Unset it to use the default ({default})."
+        )
+    return value
+
+
+def idle_timeout():
+    """Resolve ARK_IDLE_TIMEOUT (FR-10, EC-6)."""
+    return _read_positive_int_env("ARK_IDLE_TIMEOUT", DEFAULT_IDLE_TIMEOUT)
+
+
+def step_timeout():
+    """Resolve ARK_STEP_TIMEOUT (FR-10, EC-6)."""
+    return _read_positive_int_env("ARK_STEP_TIMEOUT", DEFAULT_STEP_TIMEOUT)
+
+
+# ---------------------------------------------------------------------------
+# Step outcomes — the waiting layer reports a distinct outcome (FR-6, FR-6a)
+# ---------------------------------------------------------------------------
+
+
+class _Outcome:
+    """A single waiting outcome (FR-6a).
+
+    Each outcome is a distinct singleton, so callers can compare identity/equality
+    (`outcome == StepOutcome.IDLE_TIMEOUT`) without parsing stderr. `__bool__` is
+    True ONLY for the success outcome (FINISHED), so legacy `if ok:` callsites
+    keep working: a finished step is truthy, every timeout/death is falsy, and
+    the four cases remain individually distinguishable (FR-6a, AC-6).
+    """
+
+    __slots__ = ("name", "_success")
+
+    def __init__(self, name, success):
+        self.name = name
+        self._success = success
+
+    def __bool__(self):
+        return self._success
+
+    def __repr__(self):
+        return self.name
+
+    def __str__(self):
+        return self.name
+
+
+class StepOutcome:
+    """The four distinct outcomes the waiting layer can report (FR-6a).
+
+    FINISHED is the ONLY success outcome (sentinel observed) and the only truthy
+    one. IDLE_TIMEOUT / HARD_TIMEOUT / SESSION_DIED are all falsy yet remain
+    individually distinguishable by an explicit `==` check.
+    """
+
+    FINISHED = _Outcome("FINISHED", True)
+    IDLE_TIMEOUT = _Outcome("IDLE_TIMEOUT", False)
+    HARD_TIMEOUT = _Outcome("HARD_TIMEOUT", False)
+    SESSION_DIED = _Outcome("SESSION_DIED", False)
+
+    #: Every non-success outcome. Reaching any of these means the step did NOT
+    #: finish (no sentinel) and MUST NOT advance to verify (FR-7).
+    FAILURES = (IDLE_TIMEOUT, HARD_TIMEOUT, SESSION_DIED)
+
+    #: Timeout-flavored outcomes (idle or hard ceiling) — reported as an
+    #: explicit timeout, distinct from a completed-but-failed verification.
+    TIMEOUTS = (IDLE_TIMEOUT, HARD_TIMEOUT)
+
+
+def _finished(outcome):
+    """True iff the waiting layer reported the sole success outcome (FINISHED)."""
+    return outcome is StepOutcome.FINISHED
+
+
+def probe_paths(paths):
+    """Snapshot (size, mtime) of every watched path for progress detection.
+
+    `paths` is a list of files/directories. A directory contributes the
+    (size, mtime) of every file beneath it (recursively), so a directory is
+    "advancing" when it, or any file within it, changes (AC-4). A path that does
+    not exist contributes nothing; its later creation appears as a brand-new key
+    in the snapshot and therefore registers as progress (EC-3).
+
+    Returns a dict {path_string: (size, mtime)}. Comparing two snapshots for
+    inequality answers "did anything advance?" — a changed tuple, a new key, or
+    a removed key all count as progress (a larger OR smaller size, any mtime
+    inequality). The probe walks the tree once per poll and never blocks
+    indefinitely; unreadable entries are skipped rather than raised (EC-5).
+    """
+    snap = {}
+    for p in paths:
+        path = Path(p)
+        try:
+            if path.is_dir():
+                # os.walk is iterative and returns promptly even for deep trees.
+                for dirpath, _dirnames, filenames in os.walk(path):
+                    try:
+                        dst = os.stat(dirpath)
+                        snap[dirpath] = (dst.st_size, dst.st_mtime)
+                    except OSError:
+                        pass
+                    for fn in filenames:
+                        fp = os.path.join(dirpath, fn)
+                        try:
+                            st = os.stat(fp)
+                            snap[fp] = (st.st_size, st.st_mtime)
+                        except OSError:
+                            # File vanished mid-walk (e.g. a temp file). Skip.
+                            pass
+            elif path.exists():
+                st = path.stat()
+                snap[str(path)] = (st.st_size, st.st_mtime)
+            # Non-existent path: contributes nothing now; creation later shows
+            # up as a new key and registers as progress (EC-3).
+        except OSError:
+            # Permission or transient error on this path — treat as no data.
+            pass
+    return snap
+
+
+def make_progress_probe(probe):
+    """Normalize a progress probe argument into a zero-arg callable.
+
+    `probe` may be:
+      - None  -> returns None (no probe; fallback wall-clock semantics, FR-5).
+      - a list/tuple of filesystem paths -> snapshot those paths each call.
+      - a callable -> used as-is (must return a comparable progress value).
+
+    The returned callable is invoked once per poll; its return value is compared
+    (with !=) against the previous poll's value to decide whether progress
+    occurred.
+    """
+    if probe is None:
+        return None
+    if callable(probe):
+        return probe
+    if isinstance(probe, (list, tuple)):
+        watched = list(probe)
+        return lambda: probe_paths(watched)
+    raise TypeError(
+        f"progress probe must be None, a list of paths, or a callable, "
+        f"got {type(probe).__name__}"
+    )
+
 
 # ---------------------------------------------------------------------------
 # Tmux helpers — the agent is the foreground; tmux carries the whole run
@@ -452,19 +633,106 @@ class Tmux:
         )
         subprocess.run(["tmux", "attach-session", "-t", self.session])
 
-    def wait_for_sentinel(self, sentinel_path, poll_interval=5, timeout=1800):
-        """Wait for a sentinel file to appear, meaning the command finished."""
-        start = time.time()
-        while time.time() - start < timeout:
+    def wait_for_sentinel(
+            self, sentinel_path, poll_interval=5,
+            timeout=DEFAULT_WALLCLOCK_TIMEOUT, progress_probe=None,
+            idle_timeout=None, hard_timeout=None,
+            clock=None, sleep=None):
+        """Wait for a sentinel file, returning a StepOutcome (FR-6a).
+
+        Two modes:
+
+        * **No progress probe (legacy/fallback, FR-5):** behaves exactly as the
+          pre-fix code — a single wall-clock cap at `timeout` (default 1800s).
+          Returns FINISHED on sentinel, SESSION_DIED if the session dies, or
+          IDLE_TIMEOUT once `timeout` elapses. The big ARK_STEP_TIMEOUT ceiling
+          does NOT apply here, so a hung no-probe caller stays as responsive as
+          before (AC-16).
+
+        * **Progress probe supplied (FR-1, FR-2, FR-3):** the step is alive as
+          long as a watched path keeps advancing. It times out only when no
+          progress has been seen for >= `idle_timeout` seconds (IDLE_TIMEOUT),
+          or when total elapsed reaches the hard `hard_timeout` ceiling
+          (HARD_TIMEOUT) regardless of progress. The plain `timeout` argument is
+          ignored in this mode.
+
+        The sentinel always wins: if it is present on a poll it returns FINISHED
+        and removes the file, even in the same poll that progress is observed
+        (EC-2, AC-3). `clock`/`sleep` are injectable for deterministic tests
+        (EC-4); they default to a monotonic clock and time.sleep.
+
+        All timeout comparisons use `>=` and are evaluated at each poll, so
+        detection latency is bounded by timeout + poll_interval (AC-5, AC-19).
+        """
+        clock = clock or time.monotonic
+        sleep = sleep or time.sleep
+        probe = make_progress_probe(progress_probe)
+
+        start = clock()
+        # The reference instant for the idle span: the later of (wait start, last
+        # observed progress). Starts at `start`, so a job that never writes
+        # accrues idle time from launch (AC-22).
+        last_progress = start
+        prev = probe() if probe is not None else None
+
+        if idle_timeout is None:
+            idle_timeout = timeout
+        if hard_timeout is None:
+            hard_timeout = timeout
+
+        while True:
+            # Sentinel always wins (EC-2, AC-3) — checked first, every poll.
             if os.path.exists(sentinel_path):
                 os.unlink(sentinel_path)
-                return True
+                return StepOutcome.FINISHED
+
             if not self.is_alive():
                 print("  [!] tmux session died", file=sys.stderr)
-                return False
-            time.sleep(poll_interval)
-        print(f"  [!] Timeout after {timeout}s waiting for agent", file=sys.stderr)
-        return False
+                return StepOutcome.SESSION_DIED
+
+            now = clock()
+
+            if probe is None:
+                # Fallback wall-clock semantics (FR-5, AC-16). Guard against a
+                # backward clock with max(0, ...) (EC-4).
+                elapsed = max(0, now - start)
+                if elapsed >= timeout:
+                    print(
+                        f"  [!] Timeout after {timeout}s waiting for agent",
+                        file=sys.stderr,
+                    )
+                    return StepOutcome.IDLE_TIMEOUT
+            else:
+                # Progress-aware semantics. Re-snapshot and compare.
+                cur = probe()
+                if cur != prev:
+                    # Progress observed: reset the idle timer to zero (AC-8).
+                    last_progress = now
+                    prev = cur
+
+                # max(0, ...) tolerates a non-advancing / backward clock (EC-4).
+                idle_elapsed = max(0, now - last_progress)
+                total_elapsed = max(0, now - start)
+
+                # Hard ceiling governs absolutely, even past idle config and
+                # even while progress continues (FR-3, EC-7, AC-7).
+                if total_elapsed >= hard_timeout:
+                    print(
+                        f"  [!] Hard ceiling reached after {hard_timeout}s "
+                        f"(ARK_STEP_TIMEOUT) waiting for agent",
+                        file=sys.stderr,
+                    )
+                    return StepOutcome.HARD_TIMEOUT
+
+                if idle_elapsed >= idle_timeout:
+                    print(
+                        f"  [!] Idle for {idle_timeout}s with no progress "
+                        f"(ARK_IDLE_TIMEOUT) — agent appears hung",
+                        file=sys.stderr,
+                    )
+                    return StepOutcome.IDLE_TIMEOUT
+
+            sleep(poll_interval)
 
     def is_alive(self):
         """Check if the tmux session still exists.
@@ -557,6 +825,26 @@ class Tmux:
                 return True
             stack.extend(children.get(pid, []))
         return False
+
+    def respawn_agent_pane(self):
+        """Reset the agent pane (pane 0) in place, leaving the rest of the
+        session — crucially the orchestrator in pane 1 — untouched (EC-7).
+
+        Under the inverted layout the orchestrator runs as `ark _inner` inside
+        pane 1 of this same session, so an idle-timeout recovery must NOT call
+        kill_session(): that would SIGHUP the orchestrator that is running this
+        very code. `respawn-pane -k` kills the hung agent's foreground process
+        and restarts the pane's shell in place, clearing the stale agent while
+        preserving the two-pane window so the next attempt sends into a fresh
+        prompt. Best-effort: tolerates tmux being absent like kill_session.
+        """
+        try:
+            subprocess.run(
+                ["tmux", "respawn-pane", "-k", "-t", self.agent_target],
+                capture_output=True,
+            )
+        except FileNotFoundError:
+            pass
 
     def kill_session(self):
         # Tolerate tmux being absent: reaping a session is best-effort, and the
@@ -829,38 +1117,109 @@ def make_sentinel(project_dir):
     return os.path.join(project_dir, ARK_DIR, f"_sentinel_{uuid.uuid4().hex[:8]}")
 
 
+def default_watch_set(project_dir):
+    """Default progress-watch set for a real pipeline step (FR-4, AC-17).
+
+    Watches the run's worktree output area so any agent writing output counts as
+    alive: the worktree's `results/` directory specifically (the incident
+    scenario appended to results/runs.jsonl) and the worktree directory
+    generally. Both are returned even if `results/` does not yet exist — its
+    later creation registers as progress (EC-3).
+
+    The worktree-general path lets ANY write under the worktree (a commit, a new
+    source file, a log) count as progress, so each step_* caller does not have
+    to opt in individually (AC-17).
+    """
+    return [
+        os.path.join(project_dir, "results"),
+        project_dir,
+    ]
+
+
 def run_in_tmux(
-        tmux, cmd, sentinel, timeout=1800):
+        tmux, cmd, sentinel, timeout=DEFAULT_WALLCLOCK_TIMEOUT,
+        progress_probe=None):
     """Send a command to the tmux worker and wait for the agent to signal done.
 
     The agent is instructed (via PROMPT_SENTINEL in its prompt) to create the
     sentinel file when finished. If the tmux session dies, recreates and retries.
 
+    Returns a StepOutcome (FR-6a, FR-7d) — FINISHED only when the sentinel was
+    observed; otherwise IDLE_TIMEOUT / HARD_TIMEOUT / SESSION_DIED. The outcome
+    is threaded back so callers can gate verify on FINISHED (FR-7d). A timeout is
+    NOT a finished step and NOT a successful one.
+
+    When `progress_probe` is supplied (a list of watched paths or a callable),
+    the wait is progress-aware: it survives indefinitely while output advances,
+    bounded only by the idle timeout and the hard ceiling (FR-1..FR-4). With no
+    probe, the legacy single wall-clock cap at `timeout` applies (FR-5).
+
     The session's working directory is the run's worktree: the sentinel lives in
     <worktree>/.ark/, so the worktree is sentinel.parent.parent (AC-5).
     """
+    if progress_probe is not None:
+        wait_kwargs = dict(
+            progress_probe=progress_probe,
+            idle_timeout=idle_timeout(),
+            hard_timeout=step_timeout(),
+        )
+    else:
+        wait_kwargs = dict(timeout=timeout)
+
     work_dir = str(Path(sentinel).parent.parent)
     if not tmux.is_alive():
         tmux.create_session(work_dir)
     # Send the agent command to the AGENT pane (pane 0), where it runs as that
     # pane's foreground process and renders its reasoning stream (AC-4, AC-5).
     tmux.send_command(cmd, pane=AGENT_PANE)
-    ok = tmux.wait_for_sentinel(sentinel, timeout=timeout)
-    if ok:
+    outcome = tmux.wait_for_sentinel(sentinel, **wait_kwargs)
+    if _finished(outcome):
         # End the interactive agent REPL so the agent pane is ready for the next
         # step's agent (AC-13). Targets pane 0 only — the orchestrator in pane 1
         # is untouched.
         tmux.exit_agent_repl()
         time.sleep(2)
-    if not ok and not tmux.is_alive():
+    # EC-1: preserve the existing session-death retry/recreate path. Only a
+    # genuine session death (not an idle/hard timeout, which leave artifacts
+    # intact — FR-9/EC-8) triggers a recreate-and-retry.
+    if not _finished(outcome) and not tmux.is_alive():
         print("  [!] Retrying after tmux session loss", file=sys.stderr)
         tmux.create_session(work_dir)
         tmux.send_command(cmd, pane=AGENT_PANE)
-        ok = tmux.wait_for_sentinel(sentinel, timeout=timeout)
-        if ok:
+        outcome = tmux.wait_for_sentinel(sentinel, **wait_kwargs)
+        if _finished(outcome):
             tmux.exit_agent_repl()
             time.sleep(2)
-    return ok
+    elif outcome is StepOutcome.IDLE_TIMEOUT and tmux.is_alive():
+        # IDLE_TIMEOUT only: the session is alive with the original agent hung at
+        # its prompt (no progress for >= ARK_IDLE_TIMEOUT — by definition nothing
+        # is actively writing). This is the one non-finishing outcome that loops
+        # back into run_in_tmux for a retry (run_pipeline retries idle timeouts
+        # without consuming a MAX_LOOPS attempt). Reset the stale agent pane in
+        # place so the retry sends into a fresh prompt instead of stacking a
+        # second agent command onto the hung pane. Tearing down the pane of an
+        # idle agent does NOT disturb any in-flight write (FR-9/EC-8).
+        #
+        # We respawn pane 0 ONLY — never kill_session(): under the inverted
+        # layout the orchestrator runs as `ark _inner` in pane 1 of this same
+        # session, so killing the session would SIGHUP the orchestrator running
+        # this very code (EC-7). The session stays alive, so the next attempt's
+        # send_command(..., pane=AGENT_PANE) lands in the respawned agent pane.
+        #
+        # HARD_TIMEOUT is deliberately NOT touched here: the hard ceiling can fire
+        # while output is still advancing (AC-7), and it is terminal — run_pipeline
+        # breaks immediately without retrying, so no clean pane is needed.
+        # Respawning would SIGHUP a still-progressing foreground job, which FR-9
+        # forbids ("never kill a job that is still writing output"). We report the
+        # HARD_TIMEOUT outcome and leave the live process and its artifacts intact
+        # (EC-8).
+        print(
+            "  [!] Resetting stale agent pane after idle timeout "
+            f"({outcome}) so the next attempt starts clean",
+            file=sys.stderr,
+        )
+        tmux.respawn_agent_pane()
+    return outcome
 
 
 SKIP_PERMISSIONS = os.environ.get("ARK_SKIP_PERMISSIONS", "1") == "1"
@@ -999,15 +1358,28 @@ def step_review_make(
 
 def step_implement(
         tmux, project_dir, driver="claude"):
-    """Have an agent implement the spec."""
+    """Have an agent implement the spec.
+
+    Returns a StepOutcome (FR-7d). The wait is progress-aware over the worktree
+    output area (FR-4/AC-17): an agent that keeps writing output is never killed,
+    and a timeout outcome is threaded back so run_pipeline can refuse to verify
+    partial state.
+    """
     print(f"[step:implement] Implementing (driver={driver})...")
     sentinel = make_sentinel(project_dir)
     prompt = PROMPT_IMPLEMENT.format(
         spec_path=kp(project_dir, "SPEC.md"),
     ) + PROMPT_SENTINEL.format(sentinel_path=sentinel)
     pf = write_prompt(project_dir, "implement", prompt)
-    run_in_tmux(tmux, driver_cmd(pf, project_dir, driver), sentinel)
-    print("  -> implementation complete")
+    outcome = run_in_tmux(
+        tmux, driver_cmd(pf, project_dir, driver), sentinel,
+        progress_probe=default_watch_set(project_dir),
+    )
+    if _finished(outcome):
+        print("  -> implementation complete")
+    else:
+        print(f"  -> implementation did not finish ({outcome})", file=sys.stderr)
+    return outcome
 
 
 def step_verify(feature_slug, project_dir):
@@ -1055,7 +1427,11 @@ def step_fix_make(
 
 def step_reimplement(
         tmux, project_dir, driver="claude"):
-    """Reimplement with spec + review context."""
+    """Reimplement with spec + review context.
+
+    Returns a StepOutcome (FR-7d) — see step_implement. The wait is
+    progress-aware over the worktree output area.
+    """
     print(f"[step:reimplement] Re-implementing (driver={driver})...")
     sentinel = make_sentinel(project_dir)
     prompt = PROMPT_REIMPLEMENT.format(
@@ -1063,8 +1439,15 @@ def step_reimplement(
         review_path=kp(project_dir, "REVIEW.md"),
     ) + PROMPT_SENTINEL.format(sentinel_path=sentinel)
     pf = write_prompt(project_dir, "reimplement", prompt)
-    run_in_tmux(tmux, driver_cmd(pf, project_dir, driver), sentinel)
-    print("  -> re-implementation complete")
+    outcome = run_in_tmux(
+        tmux, driver_cmd(pf, project_dir, driver), sentinel,
+        progress_probe=default_watch_set(project_dir),
+    )
+    if _finished(outcome):
+        print("  -> re-implementation complete")
+    else:
+        print(f"  -> re-implementation did not finish ({outcome})", file=sys.stderr)
+    return outcome
 
 
 def step_adversarial(
@@ -1362,6 +1745,16 @@ def run_pipeline(feature, invocation_dir, driver="claude", is_continue=False):
 
     invocation_dir = os.path.abspath(invocation_dir)
 
+    # EC-6: fail fast on a misconfigured timeout env var BEFORE launching any
+    # agent, naming the offending variable and value. A bad value must never
+    # silently degrade into an instant (zero) timeout that kills a live job.
+    try:
+        _idle = idle_timeout()
+        _step = step_timeout()
+    except ArkError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
     # EC-1: must be inside a git repository before we touch anything (AC-30).
     try:
         root = repo_root(invocation_dir)
@@ -1391,6 +1784,10 @@ def run_pipeline(feature, invocation_dir, driver="claude", is_continue=False):
     print(f"  branch:    ark/{feature_slug}")
     print(f"  tmux:      {session_name}")
     print(f"  driver:    {driver}")
+    # FR-11/AC-15: document the progress-aware tunables alongside the existing
+    # ARK_MODEL / ARK_SKIP_PERMISSIONS configuration.
+    print(f"  idle cap:  {_idle}s (ARK_IDLE_TIMEOUT)")
+    print(f"  hard cap:  {_step}s (ARK_STEP_TIMEOUT)")
     if SKIP_PERMISSIONS:
         print("  WARNING: agents run with --dangerously-skip-permissions")
         print("           set ARK_SKIP_PERMISSIONS=0 to disable")
@@ -1575,15 +1972,62 @@ def _drive_pipeline(tmux, feature, root, project_dir, feature_slug,
         step_review_make(tmux, feature_slug, project_dir)
         resume_after = "review-make"
 
-    # Phase 3: Implement + verify loop
+    # Phase 3: Implement + verify loop.
+    #
+    # A timed-out (hung) implement/reimplement step is NOT a finished step: it
+    # never advances to verify and never renders a PASS/FAIL verdict (FR-7,
+    # Defect 2). Under remedy (a), a timeout does NOT consume a MAX_LOOPS attempt
+    # (FR-8/AC-11) — only a genuinely finished-but-failing verification does.
+    #
+    # `attempt` counts only finished implementation attempts; a separate, small
+    # backstop bounds repeated non-finishing outcomes so a persistently hung or
+    # session-dying agent cannot loop forever. The hard ceiling (HARD_TIMEOUT) is
+    # the absolute backstop and is terminal — it is never retried (FR-7).
     passed = False
-    for attempt in range(1, MAX_LOOPS + 1):
-        print(f"\n--- Attempt {attempt}/{MAX_LOOPS} ---\n")
+    timed_out = False
+    attempt = 0
+    timeout_retries = 0
+    MAX_TIMEOUT_RETRIES = MAX_LOOPS
+    while attempt < MAX_LOOPS:
+        print(f"\n--- Attempt {attempt + 1}/{MAX_LOOPS} ---\n")
 
-        if attempt == 1:
-            step_implement(tmux, project_dir, driver)
+        if attempt == 0:
+            outcome = step_implement(tmux, project_dir, driver)
         else:
-            step_reimplement(tmux, project_dir, driver)
+            outcome = step_reimplement(tmux, project_dir, driver)
+
+        if not _finished(outcome):
+            # FR-7.1–FR-7.3: do NOT verify, do NOT render a verdict; report an
+            # explicit timeout, distinct from a completed-but-failed step.
+            print(
+                f"\n  [!] TIMEOUT: implement step did not finish (outcome="
+                f"{outcome}). Not running verify; no PASS/FAIL verdict rendered.",
+                file=sys.stderr,
+            )
+            if outcome == StepOutcome.HARD_TIMEOUT:
+                # Absolute backstop reached — terminal, never retried (FR-7).
+                print(
+                    "  [!] Hard ceiling (ARK_STEP_TIMEOUT) reached — stopping. "
+                    "Partial output left intact.",
+                    file=sys.stderr,
+                )
+                timed_out = True
+                break
+            # Idle timeout / session death: do not consume a MAX_LOOPS attempt
+            # (FR-8/AC-11). Retry within the timeout backstop.
+            timeout_retries += 1
+            if timeout_retries >= MAX_TIMEOUT_RETRIES:
+                print(
+                    f"  [!] Gave up after {timeout_retries} non-finishing "
+                    "attempts. Partial output left intact.",
+                    file=sys.stderr,
+                )
+                timed_out = True
+                break
+            continue
+
+        # Finished implementation — this attempt counts (FR-8).
+        attempt += 1
 
         passed = step_verify(feature_slug, project_dir)
         if passed:
@@ -1591,6 +2035,18 @@ def _drive_pipeline(tmux, feature, root, project_dir, feature_slug,
             break
 
         step_fix_make(tmux, feature_slug, project_dir)
+
+    if timed_out:
+        # FR-7.2/AC-10: a timeout is NOT a FAIL verdict. Report it as a timeout,
+        # visibly distinct from a completed-but-failed verification. Do NOT
+        # truncate or re-run over the in-flight job's output (FR-9/EC-8).
+        print(
+            f"\n  TIMED OUT — the implementation step never finished. "
+            f"No verification verdict was rendered. Artifacts left intact.",
+            file=sys.stderr,
+        )
+        archive_run(project_dir, feature_slug)
+        return 2
 
     if not passed:
         print(f"\n  FAILED after {MAX_LOOPS} attempts.")
@@ -1715,7 +2171,15 @@ Usage:
   echo 'Add auth' | ark new [--driver claude|codex]
   ark continue [slug]
   ark archive [label]
-  ark help"""
+  ark help
+
+Environment:
+  ARK_MODEL            model for all claude invocations (default: opus)
+  ARK_SKIP_PERMISSIONS 0 to drop --dangerously-skip-permissions (default: 1)
+  ARK_IDLE_TIMEOUT     seconds a step may make no progress before it is
+                       declared hung (default: 900)
+  ARK_STEP_TIMEOUT     absolute wall-clock ceiling per step, regardless of
+                       progress (default: 86400)"""
     print(msg, file=file)
 
 
