@@ -9,8 +9,9 @@ Usage:
     ark archive
 """
 
-# TODO: add the option for ark to spin up agents when it wants/needs
-# some judgement (like, "is this work good enough?")
+# ark can spin up a fresh agent on demand when it wants/needs some judgement
+# (like, "is this work good enough?"): see step_judge, which returns a yes/no
+# verdict.
 
 import functools
 import hashlib
@@ -245,6 +246,25 @@ Write nothing rather than an empty or placeholder lesson.
 
 Do NOT modify the source tree, do not commit, do not merge, do not push, and \
 do not start a new ark pipeline. Your only output is the lessons file above.
+"""
+
+PROMPT_JUDGE = """\
+You are a fresh-context judgement agent. The orchestrator needs a yes/no \
+verdict on a single quality question and has ZERO knowledge of how the work \
+was produced — base your answer only on the question and the codebase as it \
+exists right now.
+
+Explore the current project as needed to answer the question, then decide.
+
+Question:
+{question}
+
+Rules:
+- Answer ONLY the question asked. Do not fix, refactor, or modify anything.
+- Be honest. A "no" is a valid and useful answer; do not rubber-stamp.
+- Write your verdict to {verdict_path} as a single word on the first line: \
+either YES or NO (uppercase, nothing else on that line). You may add a brief \
+rationale on subsequent lines, but the first line MUST be exactly YES or NO.
 """
 
 # ---------------------------------------------------------------------------
@@ -1667,6 +1687,49 @@ def step_introspect(tmux, project_dir, archive_dir, slug, outcome):
                 leftover.unlink()
             except OSError:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# On-demand judgement — ark spawns a fresh agent for a yes/no quality call
+# ---------------------------------------------------------------------------
+
+
+def step_judge(tmux, project_dir, question, label="judge"):
+    """Spawn a fresh-context agent to answer a yes/no quality question.
+
+    This is ark's hook for delegating a judgement call ("is this work good
+    enough?") to a fresh agent at any point it wants one, rather than relying on
+    a fixed Makefile check. The agent writes YES or NO on the first line of a
+    verdict file; this returns True for YES and False for anything else.
+
+    A defensive default of False (a verdict file that is missing, empty, or does
+    not start with YES counts as "no") keeps the call conservative: an agent
+    that fails to render a clear positive verdict never reads as approval. The
+    optional `label` disambiguates the prompt/verdict scratch files so several
+    judgement calls in one run do not collide.
+    """
+    print(f"[step:{label}] Asking for judgement...")
+    sentinel = make_sentinel(project_dir)
+    verdict_name = f"_verdict_{label}.md"
+    verdict_path = Path(project_dir) / ARK_DIR / verdict_name
+    # Clear any stale verdict so we never read a previous call's answer.
+    if verdict_path.exists():
+        verdict_path.unlink()
+
+    prompt = PROMPT_JUDGE.format(
+        question=question.strip(),
+        verdict_path=str(verdict_path),
+    ) + PROMPT_SENTINEL.format(sentinel_path=sentinel)
+    pf = write_prompt(project_dir, label, prompt)
+    run_in_tmux(tmux, claude_cmd(pf), sentinel)
+
+    if not verdict_path.exists():
+        print("  -> no verdict written (treating as NO)", file=sys.stderr)
+        return False
+    first_line = verdict_path.read_text().strip().splitlines()
+    verdict = bool(first_line) and first_line[0].strip().upper() == "YES"
+    print(f"  -> verdict: {'YES' if verdict else 'NO'}")
+    return verdict
 
 
 # ---------------------------------------------------------------------------
