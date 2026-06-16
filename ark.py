@@ -646,12 +646,21 @@ class Tmux:
         `ark continue` after a detach) must come up with the agent pane primary
         even if the user had focused the status pane before detaching (AC-3,
         AC-18).
+
+        Returns True if the attach actually happened (and the user has since
+        detached), or False if tmux could not attach — e.g. there is no
+        controlling terminal on stdin because ark was launched from a pipe
+        (`grep ... | ark new`), which makes tmux print "open terminal failed:
+        not a terminal" and exit non-zero. The caller uses this to print honest
+        messaging instead of an unconditional "Detached" that mislabels a failed
+        attach as a normal detach.
         """
         subprocess.run(
             ["tmux", "select-pane", "-t", self.agent_target],
             capture_output=True,
         )
-        subprocess.run(["tmux", "attach-session", "-t", self.session])
+        result = subprocess.run(["tmux", "attach-session", "-t", self.session])
+        return result.returncode == 0
 
     def wait_for_sentinel(
             self, sentinel_path, poll_interval=5,
@@ -1970,10 +1979,25 @@ def run_pipeline(feature, invocation_dir, driver="claude", is_continue=False):
         # running (FR-6); this outer process just exits.
         if not already_driving:
             _launch_inner_orchestrator(tmux, project_dir, feature_slug, driver)
-        tmux.attach()
-        print(f"\n  Detached. The run continues in tmux session "
-              f"'{session_name}'.")
-        print(f"  Re-attach: ark continue {feature_slug}  "
+        attached = tmux.attach()
+        if attached:
+            # The user attached and then detached. The in-tmux orchestrator
+            # keeps driving the run after the detach (FR-6).
+            print(f"\n  Detached. The run continues in tmux session "
+                  f"'{session_name}'.")
+        else:
+            # tmux could not attach — almost always because ark was launched
+            # from a pipe (`grep ... | ark new`), so stdin is not a controlling
+            # terminal and tmux printed "open terminal failed: not a terminal".
+            # The run is NOT a failure: the inner orchestrator is already driving
+            # it inside tmux. Say so plainly so a failed attach is not mistaken
+            # for a crashed run.
+            print(f"\n  Launched OK. (Could not auto-attach: ark was started "
+                  f"without a terminal on stdin — e.g. from a pipe — so the "
+                  f"'open terminal failed: not a terminal' message above is "
+                  f"expected, not an error.)")
+            print(f"  The run is LIVE in tmux session '{session_name}'.")
+        print(f"  Attach: ark continue {feature_slug}  "
               f"(or tmux attach -t {session_name})")
         print(f"  Branch ark/{feature_slug} will be ready to merge when the run "
               f"finishes.")
@@ -2246,6 +2270,42 @@ Environment:
     print(msg, file=file)
 
 
+def _print_success_banner(file=sys.stdout):
+    """Celebrate a successful pipeline run with emojis and firecrackers."""
+    line = "🎉🧨✨🎊🥳🚀🔥💥🎆🎇  🧨🎉🥳🚀✨🎊🔥💥🎆🎇"
+    print(file=file)
+    print(line, file=file)
+    print("🧨🎉  ARK SUCCEEDED!   all steps passed  🎉🧨", file=file)
+    print(line, file=file)
+    print(file=file)
+
+
+def _print_failure_banner(file=sys.stderr):
+    """Mark a failed pipeline run with big red X's."""
+    red = "\033[1;31m" if file.isatty() else ""
+    reset = "\033[0m" if file.isatty() else ""
+    big_x = [
+        "  ███     ███  ",
+        "   ███   ███   ",
+        "    ███ ███    ",
+        "     █████     ",
+        "    ███ ███    ",
+        "   ███   ███   ",
+        "  ███     ███  ",
+    ]
+    print(file=file)
+    print(f"{red}❌❌❌  ARK FAILED  ❌❌❌{reset}", file=file)
+    for row in big_x:
+        print(f"{red}{row}{reset}", file=file)
+    print(f"{red}❌❌❌  ARK FAILED  ❌❌❌{reset}", file=file)
+    print(file=file)
+
+
+# Commands that run the pipeline and should get a success/failure banner.
+# Informational commands (help, archive) exit without fanfare.
+_BANNER_COMMANDS = {"new", "continue", "_inner"}
+
+
 def main():
     if len(sys.argv) < 2:
         print_help(file=sys.stderr)
@@ -2388,4 +2448,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    _is_pipeline = len(sys.argv) >= 2 and sys.argv[1] in _BANNER_COMMANDS
+    try:
+        main()
+        code = 0
+    except SystemExit as e:
+        # sys.exit(None) -> 0; sys.exit(int) -> that code; sys.exit("msg") -> 1
+        code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+    if _is_pipeline:
+        if code == 0:
+            _print_success_banner()
+        else:
+            _print_failure_banner()
+    sys.exit(code)
