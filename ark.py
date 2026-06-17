@@ -1483,7 +1483,9 @@ def step_adversarial(
         tmux, project_dir, iteration=1):
     """Spawn two adversarial reviewers sequentially.
 
-    Returns True if BLOCK or WARN findings were detected, False otherwise.
+    Returns True if any BLOCK finding (or a missing review file) was detected,
+    False otherwise. WARN/NOTE findings do not fail the review, matching the
+    reviewers' rubric (PASS = 0 BLOCKs).
     Output files are named adversarial-claude-{iteration}.md and
     adversarial-codex-{iteration}.md.
     """
@@ -1517,14 +1519,19 @@ def step_adversarial(
     run_in_tmux(tmux, codex_cmd_str, sentinel)
     print(f"  -> {codex_name}")
 
-    # Check for BLOCK/WARN findings or missing review files (agent failure)
+    # Only BLOCK findings fail a review. The reviewers' own rubric (see
+    # PROMPT_ADVERSARIAL) is PASS = 0 BLOCKs; WARN is "not immediate failure"
+    # and NOTE is informational. Counting WARN/NOTE here poisons has_findings so
+    # the convergence early-exit never fires and a clean run is misreported as
+    # "adversarial findings remained" (Regina add-a-skill-ladder run, 2026-06-16).
+    # A missing review file is an agent failure and still blocks.
     for name in [claude_name, codex_name]:
         p = Path(project_dir) / ARK_DIR / name
         if not p.exists():
             print(f"  [!] {name} missing — treating as findings present", file=sys.stderr)
             return True
         content = p.read_text()
-        if "BLOCK:" in content or "WARN:" in content:
+        if "#### BLOCK:" in content:
             return True
     return False
 
