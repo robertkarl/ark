@@ -280,6 +280,12 @@ ARK_DIR = ".ark"
 # Machine-global, append-only lessons file (one per machine, outside any repo).
 # Introspection appends lessons here; every agent step injects its contents.
 GLOBAL_LESSONS_FILE = Path("~/.ark/LESSONS.md").expanduser()
+# Machine-global archive root, keyed by project name (gstack-style:
+# ~/.ark/archive/<project>/<run>). Run artifacts (SPEC, reviews, adversarial
+# findings) are copied here so they SURVIVE worktree deletion — the worktree's
+# own .ark/archive/ dies with `git worktree remove`, so it must never be the
+# only copy.
+GLOBAL_ARCHIVE_ROOT = Path("~/.ark/archive").expanduser()
 # Run-local copy of lessons, written into the archive directory alongside the
 # archived SPEC.md and other artifacts (AC-21).
 RUN_LESSONS_FILENAME = "LESSONS.md"
@@ -1588,12 +1594,42 @@ def detect_resume_point(feature_slug, project_dir):
 # ---------------------------------------------------------------------------
 
 
+def project_name(cwd=None):
+    """Stable project name for a repo, identical across all its worktrees.
+
+    Derived from the parent of the *common* git dir (the main repo root), so an
+    ARK run executing inside a throwaway worktree still maps to the real
+    project. Used to key the machine-global archive (gstack-style).
+    """
+    try:
+        common = Path(git_common_dir(cwd=cwd))
+    except ArkError:
+        return "unknown-project"
+    # common dir is <repo>/.git (or a worktrees/<x> under it); its parent that
+    # holds the .git is the project root. Walk up to the dir literally named .git.
+    p = common
+    while p.name != ".git" and p.parent != p:
+        p = p.parent
+    root = p.parent if p.name == ".git" else common.parent
+    return root.name or "unknown-project"
+
+
+def global_archive_dir(project_dir, archive_name):
+    """~/.ark/archive/<project>/<archive_name> — survives worktree deletion."""
+    return GLOBAL_ARCHIVE_ROOT / project_name(cwd=project_dir) / archive_name
+
+
 def archive_run(project_dir, label=None):
-    """Move every .ark/ artifact into .ark/archive/<timestamp>/.
+    """Archive every .ark/ artifact: copy to the machine-global archive first
+    (survives worktree deletion), then move into .ark/archive/<timestamp>/.
 
     Archiving is terminal: it sweeps the whole run out of .ark/ so the run is no
     longer discoverable or resumable. An archived run is gone — start a fresh run
     if you want to revisit the feature.
+
+    The global copy at ~/.ark/archive/<project>/<run> is the durable record. The
+    in-worktree copy is convenience only and dies with `git worktree remove`, so
+    it is never the sole copy of a run's review trail.
     """
     ark_dir = Path(project_dir) / ARK_DIR
     if not ark_dir.exists():
@@ -1606,14 +1642,28 @@ def archive_run(project_dir, label=None):
     else:
         archive_name = ts
 
+    # 1. Durable global copy FIRST, so a later worktree removal cannot orphan
+    #    the only record of this run.
+    global_dir = global_archive_dir(project_dir, archive_name)
+    try:
+        global_dir.mkdir(parents=True, exist_ok=True)
+        for f in ark_dir.iterdir():
+            if f.name == "archive" or not f.is_file():
+                continue
+            shutil.copy2(str(f), str(global_dir / f.name))
+        print(f"  Archived (durable) to {global_dir}")
+    except OSError as e:
+        # Don't let a global-copy failure abort the run's terminal step, but be
+        # loud — the worktree copy below would otherwise be the only record.
+        print(f"  WARNING: durable archive to {global_dir} failed: {e}",
+              file=sys.stderr)
+
+    # 2. In-worktree archive (convenience; sweeps .ark/ clean). Dies with the
+    #    worktree — that's fine, the global copy above is authoritative.
     archive_dir = ark_dir / "archive" / archive_name
     archive_dir.mkdir(parents=True, exist_ok=True)
-
-    # Move all artifacts out of .ark/ (skip the archive directory itself).
-    for f in ark_dir.iterdir():
-        if f.name == "archive":
-            continue
-        if not f.is_file():
+    for f in list(ark_dir.iterdir()):
+        if f.name == "archive" or not f.is_file():
             continue
         shutil.move(str(f), str(archive_dir / f.name))
 
