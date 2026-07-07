@@ -21,10 +21,10 @@ From inside the `ark` repo:
 /deacon
 ```
 
-The deacon runs one patrol immediately, files any tickets, then reschedules
-itself for +15 min via the harness wakeup. The loop lives inside your Claude
-Code session — closing the session stops the deacon. Say "stop the deacon" to
-cancel the schedule.
+The deacon runs one patrol immediately, files any tickets, then arms a recurring
+`CronCreate` job (every ~17 min) that re-invokes `/deacon`. The loop lives inside
+your Claude Code session — it's session-only (dies when you close the session)
+and cron auto-expires after 7 days. Say "stop the deacon" to delete the job.
 
 ## How it works
 
@@ -44,17 +44,22 @@ cancel the schedule.
    wastes inspectors (tens of thousands of tokens each) auditing dead runs.
 2. The deacon spawns **one inspector subagent per session, in parallel, on
    Sonnet** (the cheap model — inspection is bounded, mechanical pattern-matching,
-   so a 15-min patrol stays affordable). Each inspector `capture-pane`s its
-   session, reads the run's `.ark/` artifacts
-   (`SPEC.md`, `verify-*.mk`, `REVIEW.md`, commits), and judges each acceptance
-   criterion against the known cheat shapes (cross-referencing
-   `~/.ark/LESSONS.md`). It applies an 80% confidence bar and returns `CLEAN` or
-   structured findings.
+   so a ~15-min patrol stays affordable). Each inspector `capture-pane`s its
+   session, reads the run's `.ark/` artifacts (`SPEC.md`, `verify-*.mk`,
+   `REVIEW.md`) and git history, and hunts two categories: **(A) false-green
+   verify checks** — grep-for-symbol proxies, always-true one-liners,
+   vacuous/stubbed build gates, assertions on the harness's own output,
+   hard-coded expected values, error-swallowing checks, self-authored evidence;
+   and **(B) prompt-rule violations** the agents are told not to commit —
+   mutating `.ark/SPEC.md`/`verify-*.mk`, `git merge`, pushing, or writing
+   product code into the verify Makefile. The known-cheat catalog is
+   `~/.ark/LESSONS.md` (read fresh each patrol; it evolves). Each inspector
+   applies an 80% confidence bar and returns `CLEAN` or structured findings.
 3. For each confirmed finding, the deacon **dedups** against the repo's existing
-   open tickets (the patrol runs every 15 min — it won't page twice for the same
+   open tickets (the patrol runs every ~17 min — it won't page twice for the same
    cheat), then `file-ticket.sh` allocates the next `<PREFIX>-<n>` ID and writes
    a SEV-2 ticket in tcorp's markdown format.
-4. It prints a one-line summary and reschedules the next patrol.
+4. It prints a one-line summary; the recurring cron fires the next patrol.
 
 ## Files
 
