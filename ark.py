@@ -16,6 +16,7 @@ Usage:
 import functools
 import hashlib
 import os
+import threading
 import re
 import shlex
 import shutil
@@ -1014,19 +1015,57 @@ def _haiku_title(feature, timeout):
     return title or None
 
 
-def slugify(text):
-    """Turn a feature description into a short slug via the FALLBACK method.
+def _model_slug_base(feature, timeout):
+    """Ask the Haiku seam for a title and sanitize it to a slug base (FR-1).
 
-    This is the deterministic, model-free derivation: first-four-words base plus
-    a feature-text hash suffix. It is preserved byte-for-byte from the historic
-    implementation so (a) the resume path re-derives old runs to their original
-    slug and (b) it is the fallback whenever Haiku yields no usable result
-    (SPEC FR-7, EC-2, AC-13, AC-18).
+    The seam call is bounded by a WALL-CLOCK timeout enforced here, in the
+    caller, rather than relying on the seam's internal subprocess timeout — the
+    seam is an injectable boundary (FR-10) that a test may replace with a hanging
+    stub, so the bound must live outside it (AC-14/FR-8/EC-7). A stubbed hang is
+    abandoned on a daemon thread (it cannot block interpreter exit) and we return
+    "" so the caller falls back.
 
-    New runs derive their base via Haiku through `derive_slug`; `slugify` itself
-    never calls the model, so it stays a pure function usable on the resume path.
+    Returns a sanitized, non-empty base, or "" when the model is unavailable,
+    times out, or yields nothing usable (FR-7, EC-4/EC-5/EC-7/EC-8/EC-12).
     """
-    return f"{_fallback_base(text)}-{slug_suffix(text)}"
+    result = {}
+
+    def _run():
+        try:
+            result["title"] = _haiku_title(feature, timeout)
+        except BaseException as e:  # a stubbed seam may raise (AC-13)
+            result["error"] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        # Seam is still running past the bound (hung) — abandon it (EC-7/AC-14).
+        return ""
+    title = result.get("title")
+    if not title:
+        return ""
+    return sanitize_slug_base(title)
+
+
+def slugify(text, timeout=None):
+    """Turn a feature description into a short slug (SPEC FR-1, FR-7).
+
+    Derives the base via the Haiku seam (`_model_slug_base`), falling back to the
+    historic first-four-words base whenever the model is unavailable, times out,
+    or yields nothing usable (FR-7, EC-2/EC-4/EC-7/EC-8/EC-12). The disambiguating
+    suffix is always the feature-text hash (never model-derived), so distinctness
+    and per-text determinism hold on either path (AC-4/AC-5/AC-6).
+
+    This is a *stateless* derivation: it does not consult or write any per-run
+    cache, so it is safe to call for a genuinely new base. Resume safety for a
+    live run is provided by `derive_slug`, which prefers the persisted slug and
+    keeps live model output off the resume path (FR-5/FR-6).
+    """
+    if timeout is None:
+        timeout = slug_timeout()
+    base = _model_slug_base(text, timeout) or _fallback_base(text)
+    return f"{base}-{slug_suffix(text)}"
 
 
 def _persisted_slug_for_feature(feature, root):
@@ -1043,6 +1082,16 @@ def _persisted_slug_for_feature(feature, root):
     the worktree scan can't run (e.g. not in a git repo yet) — the caller then
     derives freshly via Haiku.
     """
+    # A run's own directory may itself carry the cache (`.ark/SLUG`), keyed by a
+    # matching `.ark/FEATURE.md`. This is the SPEC-recommended per-run mechanism
+    # and the one `ark continue` hits directly: the run dir passed here already
+    # holds FEATURE.md/SLUG from `ark new`, so we reuse the chosen slug without
+    # calling the model. Checked before the worktree scan so it works even when
+    # `root` is the run dir itself rather than a repo with registered worktrees.
+    cached = _slug_cache_read(feature, root)
+    if cached is not None:
+        return cached
+
     try:
         runs = find_ark_worktrees(root)
     except Exception:
@@ -1064,6 +1113,99 @@ def _persisted_slug_for_feature(feature, root):
         # No persisted SLUG (pre-change run): the worktree dir name IS the slug.
         return Path(path).name
     return None
+
+
+def _is_git_repo_dir(path):
+    """True if `path` is inside a git working tree (a shared repo root).
+
+    Used to tell a DEDICATED per-run directory (a plain scratch dir handed to
+    the derivation, e.g. before its worktree exists) apart from a SHARED repo
+    root. The production `derive_slug(feature, root)` call passes a repo root,
+    which must NOT accumulate a bare `.ark/SLUG` that a later different-feature
+    run would wrongly reuse; there, resume is resolved by the worktree scan.
+    """
+    try:
+        r = _git(["rev-parse", "--is-inside-work-tree"], cwd=str(path))
+    except Exception:
+        return False
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def _slug_cache_read(feature, run_dir):
+    """Read a run dir's own persisted slug cache (`<run_dir>/.ark/SLUG`).
+
+    Returns the cached final slug when `<run_dir>/.ark/SLUG` exists AND either:
+      - `<run_dir>/.ark/FEATURE.md` matches this feature text (the run is pinned
+        to this feature), or
+      - there is no FEATURE.md AND `run_dir` is a dedicated per-run dir (not a
+        shared git repo root) — a bare cache handed to us directly.
+    Returns None otherwise so the caller derives freshly.
+
+    A bare SLUG at a shared repo root is deliberately ignored: an earlier run for
+    a DIFFERENT feature could have left it there, so reusing it would mis-key the
+    resume (a collision bug). In production `run_dir` IS a repo root, so this
+    returns None and the worktree scan does the real per-run resolution.
+
+    This is what keeps live model output off the resume path (SPEC FR-5/FR-6,
+    §9): once `ark new` writes SLUG for a run, every later derivation reuses it
+    byte-for-byte without consulting the model.
+    """
+    try:
+        ark_dir = Path(run_dir) / ARK_DIR
+        slug = (ark_dir / "SLUG").read_text().strip()
+    except OSError:
+        return None
+    if not slug:
+        return None
+    try:
+        persisted_feature = (ark_dir / "FEATURE.md").read_text().strip()
+    except OSError:
+        persisted_feature = None
+    if persisted_feature is not None:
+        # FEATURE.md pins the run: the cache is valid only for its exact feature.
+        return slug if persisted_feature == feature.strip() else None
+    # No FEATURE.md: trust a bare SLUG only for a dedicated (non-repo-root) dir.
+    return None if _is_git_repo_dir(run_dir) else slug
+
+
+def _slug_cache_write_allowed(feature, run_dir):
+    """Whether it's safe to persist a slug cache into `run_dir` (FR-5).
+
+    Safe only when `run_dir` unambiguously identifies THIS feature's run and
+    isn't a shared repo root hosting other runs:
+      - `<run_dir>/.ark/FEATURE.md` matches this feature -> it is the run dir;
+      - or there is no `.ark/FEATURE.md` AND `run_dir` is a dedicated per-run dir
+        (not a shared git repo root) -> a fresh scratch dir for this run.
+    A mismatching FEATURE.md, or a repo-root dir, means `run_dir` is shared; we
+    must not drop a bare SLUG there that would shadow later, different `ark new`
+    invocations, so we skip and let run-setup persist into the worktree instead.
+    """
+    ark_dir = Path(run_dir) / ARK_DIR
+    try:
+        persisted_feature = (ark_dir / "FEATURE.md").read_text().strip()
+    except OSError:
+        persisted_feature = None
+    if persisted_feature is not None:
+        return persisted_feature == feature.strip()
+    return not _is_git_repo_dir(run_dir)
+
+
+def _slug_cache_write(slug, run_dir):
+    """Persist the chosen slug to `<run_dir>/.ark/SLUG`, write-once (FR-5).
+
+    Best-effort: if the run dir isn't writable yet (derivation can precede
+    worktree creation in some flows) we simply skip — the real run-setup path
+    (run_pipeline) also persists SLUG into the worktree, so the resume contract
+    is still satisfied there.
+    """
+    try:
+        ark_dir = Path(run_dir) / ARK_DIR
+        ark_dir.mkdir(exist_ok=True)
+        slug_file = ark_dir / "SLUG"
+        if not slug_file.exists():
+            slug_file.write_text(slug)
+    except OSError:
+        pass
 
 
 def derive_slug(feature, root, timeout=None):
@@ -1090,13 +1232,18 @@ def derive_slug(feature, root, timeout=None):
     if timeout is None:
         timeout = slug_timeout()
 
-    base = ""
-    title = _haiku_title(feature, timeout)
-    if title:
-        base = sanitize_slug_base(title)
-    if not base:
-        base = _fallback_base(feature)
-    return f"{base}-{slug_suffix(feature)}"
+    base = _model_slug_base(feature, timeout) or _fallback_base(feature)
+    slug = f"{base}-{slug_suffix(feature)}"
+
+    # Persist the freshly-chosen slug into this run dir so the next derivation
+    # (a repeated `ark new`, or `ark continue`) reuses it without calling the
+    # model — the load-bearing determinism guarantee (FR-5/FR-6, AC-10/AC-11/
+    # AC-19). Only persist when the run dir already identifies this feature
+    # (its FEATURE.md matches or is absent), never into a repo root that hosts
+    # unrelated runs.
+    if _slug_cache_write_allowed(feature, root):
+        _slug_cache_write(slug, root)
+    return slug
 
 
 def ensure_dir(project_dir):
