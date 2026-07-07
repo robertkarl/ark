@@ -299,6 +299,15 @@ DEFAULT_WALLCLOCK_TIMEOUT = 1800
 DEFAULT_IDLE_TIMEOUT = 900       # 15 minutes
 DEFAULT_STEP_TIMEOUT = 86400     # 24 hours
 
+# Bound on the Haiku slug-summarization call (SPEC FR-8). A slow/hung model call
+# must never stall `ark new`; on exceeding this bound the fallback slug applies.
+# Overridable with ARK_SLUG_TIMEOUT, following the ARK_IDLE_TIMEOUT convention.
+DEFAULT_SLUG_TIMEOUT = 8         # seconds
+# The small/fast model used to summarize a feature description into a slug base.
+# The concrete identity is an implementation detail (SPEC §2); overridable so a
+# machine without a `haiku` alias can point at whatever fast model it has.
+SLUG_MODEL = os.environ.get("ARK_SLUG_MODEL", "haiku")
+
 # Worktrees live under .git/<WORKTREE_SUBDIR>/<slug>. This keeps them out of
 # the repository-root working tree (so they never show up as tracked or
 # untracked entries) while remaining deterministic and tied to the repo.
@@ -363,6 +372,17 @@ def idle_timeout():
 def step_timeout():
     """Resolve ARK_STEP_TIMEOUT (FR-10, EC-6)."""
     return _read_positive_int_env("ARK_STEP_TIMEOUT", DEFAULT_STEP_TIMEOUT)
+
+
+def slug_timeout():
+    """Resolve ARK_SLUG_TIMEOUT (SPEC FR-8).
+
+    Bounds the Haiku slug-summarization call. Same fail-fast validation as the
+    other timeouts: a non-numeric or non-positive value aborts rather than
+    silently degrading (which here would mean an instant fallback that masks an
+    operator typo).
+    """
+    return _read_positive_int_env("ARK_SLUG_TIMEOUT", DEFAULT_SLUG_TIMEOUT)
 
 
 # ---------------------------------------------------------------------------
@@ -910,17 +930,173 @@ def kf_exists(project_dir, filename):
     return p.exists() and p.stat().st_size > 0
 
 
-def slugify(text):
-    """Turn feature description into a short slug.
+# Slug-base bounds (SPEC AC-3): at most 4 hyphen-separated words, at most 48
+# chars. Kept no longer than the historic 4-word ceiling so a base still reads
+# and `cd`s cleanly.
+SLUG_MAX_WORDS = 4
+SLUG_MAX_CHARS = 48
 
-    Appends a short hash to avoid collisions when two features share the
-    same first 4 words (e.g., 'add auth login flow extra' vs
-    'add auth login flow different').
+
+def slug_suffix(text):
+    """Deterministic disambiguating suffix (SPEC AC-4).
+
+    A pure function of the feature TEXT — never of model output — so two features
+    that summarize to the same base still produce distinct slugs, and the same
+    feature always yields the same suffix (the load-bearing determinism, §9).
+    """
+    return hashlib.sha1(text.lower().encode()).hexdigest()[:6]
+
+
+def _fallback_base(text):
+    """The pre-existing first-four-words slug base (SPEC FR-7, EC-2).
+
+    Kept byte-for-byte identical to the historic derivation so old-style runs
+    re-derive to their original slug (AC-13/AC-18) and existing tests hold.
     """
     words = re.sub(r"[^a-z0-9\s]", "", text.lower()).split()
-    base = "-".join(words[:4]) or "feature"
-    suffix = hashlib.sha1(text.lower().encode()).hexdigest()[:6]
-    return f"{base}-{suffix}"
+    return "-".join(words[:SLUG_MAX_WORDS]) or "feature"
+
+
+def sanitize_slug_base(text):
+    """Sanitize an arbitrary title into a slug base satisfying SPEC §4 bounds.
+
+    Lowercases, strips every character outside [a-z0-9], collapses runs of
+    non-alnum into single hyphens, trims leading/trailing hyphens (EC-3, EC-9),
+    caps the result at SLUG_MAX_WORDS words and SLUG_MAX_CHARS characters
+    (AC-3, EC-5) without leaving a trailing hyphen. Returns "" when nothing
+    usable survives (EC-4, EC-12) so the caller can fall back.
+    """
+    # Lowercase, replace any run of non-alphanumerics (incl. unicode) with a
+    # single hyphen. Splitting an ASCII lowercase re handles multibyte input
+    # safely: non-ASCII bytes are non-alnum here and become separators, so no
+    # multibyte character is ever split into an invalid half (EC-5).
+    words = [w for w in re.sub(r"[^a-z0-9]+", " ", text.lower()).split() if w]
+    words = words[:SLUG_MAX_WORDS]
+    base = "-".join(words)
+    if len(base) > SLUG_MAX_CHARS:
+        base = base[:SLUG_MAX_CHARS].rstrip("-")
+    return base
+
+
+def _haiku_title(feature, timeout):
+    """Injectable model seam (SPEC FR-10): summarize a feature into a title.
+
+    Returns the model's raw title string, or None on any failure — missing CLI,
+    no credentials, offline, timeout, non-zero exit, or empty output. Callers
+    MUST treat None (and any output that sanitizes to empty) as "no usable
+    result" and fall back (FR-7/FR-9). This is the single seam a test forces to
+    return a canned title (AC-12) or to fail/hang (AC-13/AC-14); it is therefore
+    a function boundary, not an implementation detail.
+
+    Uses the same `claude` CLI invocation shape the rest of ark uses (no Python
+    Anthropic SDK is assumed, per SPEC §10), in non-interactive `-p` mode so it
+    returns a string rather than opening a REPL.
+    """
+    prompt = (
+        "Summarize the following software task as a short branch name: at most "
+        "four words, lowercase, words separated by single spaces, no punctuation "
+        "or quotes. Reply with ONLY the title and nothing else.\n\n"
+        f"Task:\n{feature}"
+    )
+    try:
+        result = subprocess.run(
+            ["claude", "--model", SLUG_MODEL, "-p", prompt],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        # Timeout (EC-7), CLI missing / not executable (EC-8) — degrade quietly.
+        return None
+    if result.returncode != 0:
+        return None
+    title = (result.stdout or "").strip()
+    return title or None
+
+
+def slugify(text):
+    """Turn a feature description into a short slug via the FALLBACK method.
+
+    This is the deterministic, model-free derivation: first-four-words base plus
+    a feature-text hash suffix. It is preserved byte-for-byte from the historic
+    implementation so (a) the resume path re-derives old runs to their original
+    slug and (b) it is the fallback whenever Haiku yields no usable result
+    (SPEC FR-7, EC-2, AC-13, AC-18).
+
+    New runs derive their base via Haiku through `derive_slug`; `slugify` itself
+    never calls the model, so it stays a pure function usable on the resume path.
+    """
+    return f"{_fallback_base(text)}-{slug_suffix(text)}"
+
+
+def _persisted_slug_for_feature(feature, root):
+    """Return the slug already chosen for `feature`, if a run for it exists.
+
+    This keeps live model output OFF the resume path (SPEC FR-5/FR-6, §9): on
+    any derivation for a feature whose run already exists, we reuse the slug that
+    named it at creation rather than re-summarizing. A run is matched by its
+    persisted feature TEXT (`.ark/FEATURE.md`), and its chosen slug is read from
+    `.ark/SLUG` (falling back to the worktree directory name for runs created
+    before SLUG was persisted — AC-18).
+
+    Returns None when no existing run matches (a genuinely new `ark new`), or if
+    the worktree scan can't run (e.g. not in a git repo yet) — the caller then
+    derives freshly via Haiku.
+    """
+    try:
+        runs = find_ark_worktrees(root)
+    except Exception:
+        return None
+    for _dirname, path in runs:
+        try:
+            persisted_feature = (Path(path) / ARK_DIR / "FEATURE.md").read_text().strip()
+        except OSError:
+            continue
+        if persisted_feature != feature.strip():
+            continue
+        slug_file = Path(path) / ARK_DIR / "SLUG"
+        try:
+            slug = slug_file.read_text().strip()
+            if slug:
+                return slug
+        except OSError:
+            pass
+        # No persisted SLUG (pre-change run): the worktree dir name IS the slug.
+        return Path(path).name
+    return None
+
+
+def derive_slug(feature, root, timeout=None):
+    """Resume-safe slug derivation for a run (SPEC FR-1..FR-8).
+
+    Resolution order, chosen so live model output is never on the resume path:
+      1. If a run for this exact feature text already exists, reuse its chosen
+         slug (persisted `.ark/SLUG`, or its worktree dir name for old runs).
+         No model call — this is what `ark continue` and a repeated `ark new`
+         hit, guaranteeing a byte-identical slug (AC-5/AC-10/AC-11/AC-18/AC-19).
+      2. Otherwise (a genuinely new run), ask Haiku for a title, sanitize it to
+         a slug base, and use it — falling back to the first-four-words base if
+         the model is unavailable, times out, or yields nothing usable
+         (FR-7/FR-8/FR-9, EC-2/EC-4/EC-5/EC-7/EC-8/EC-12).
+
+    The suffix is always the feature-text hash (never model-derived), so
+    distinctness and determinism hold regardless of which branch is taken
+    (AC-4/AC-6).
+    """
+    existing = _persisted_slug_for_feature(feature, root)
+    if existing is not None:
+        return existing
+
+    if timeout is None:
+        timeout = slug_timeout()
+
+    base = ""
+    title = _haiku_title(feature, timeout)
+    if title:
+        base = sanitize_slug_base(title)
+    if not base:
+        base = _fallback_base(feature)
+    return f"{base}-{slug_suffix(feature)}"
 
 
 def ensure_dir(project_dir):
@@ -1891,7 +2067,11 @@ def run_pipeline(feature, invocation_dir, driver="claude", is_continue=False):
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
-    feature_slug = slugify(feature)
+    # Resume-safe slug (SPEC FR-5): reuse an existing run's chosen slug when one
+    # exists for this feature (ark continue, repeated ark new), otherwise ask
+    # Haiku for a short human-readable base. Model output never reaches the
+    # resume path — derive_slug consults persisted state first.
+    feature_slug = derive_slug(feature, root)
     session_name = f"ark-{feature_slug}"
 
     # EC-2..EC-6: create or reuse the run's dedicated worktree.
@@ -1933,6 +2113,14 @@ def run_pipeline(feature, invocation_dir, driver="claude", is_continue=False):
     feature_file = Path(project_dir) / ARK_DIR / "FEATURE.md"
     if not feature_file.exists():
         feature_file.write_text(feature)
+
+    # Persist the chosen slug (SPEC FR-5): once written, every later derivation
+    # for this run reuses this exact value via _persisted_slug_for_feature, so
+    # the slug is byte-stable across `ark continue` even if the model would now
+    # return a different title (FR-6, AC-19). Write-once, like FEATURE.md.
+    slug_file = Path(project_dir) / ARK_DIR / "SLUG"
+    if not slug_file.exists():
+        slug_file.write_text(feature_slug)
 
     # Check resume point (based on artifacts in this worktree's .ark/) — AC-18.
     resume_after = detect_resume_point(feature_slug, project_dir)
@@ -2323,7 +2511,10 @@ Environment:
   ARK_IDLE_TIMEOUT     seconds a step may make no progress before it is
                        declared hung (default: 900)
   ARK_STEP_TIMEOUT     absolute wall-clock ceiling per step, regardless of
-                       progress (default: 86400)"""
+                       progress (default: 86400)
+  ARK_SLUG_TIMEOUT     seconds to wait for Haiku to summarize the feature into
+                       a slug before falling back to first-4-words (default: 8)
+  ARK_SLUG_MODEL       fast model used to summarize the slug (default: haiku)"""
     print(msg, file=file)
 
 
