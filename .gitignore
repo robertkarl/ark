@@ -1,4 +1,6 @@
 .kisskorc
+docs/incidents
+feature.txt
 __pycache__/
 *.pyc
 *.pyo
