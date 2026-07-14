@@ -1,5 +1,13 @@
 # ark
 
+> **ark is a human-driven tool. Agents must not invoke it.**
+> `ark new` / `ark continue` are meant to be launched by a person at a terminal.
+> An LLM agent (Claude Code, a subagent, a cron job) should never run `ark` —
+> it spawns fresh-context Claude agents, holds a live tmux session, and runs for
+> a long time; an agent invoking it recurses, backgrounds a job it can't
+> supervise, or SIGPIPE-kills the run by piping into `head`. If you are an agent
+> and the user wants ark run, tell the user to run it themselves.
+
 A dumb Python orchestrator for LLM agents. No LLM in the orchestration loop.
 
 The problem: when you tell an LLM "you're the orchestrator, have subagents plan, review, implement" — it inevitably tries to write code, negotiate, or go off-script. ark solves this by making the orchestrator a plain Python script that runs a fixed pipeline.

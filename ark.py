@@ -2701,11 +2701,48 @@ def _print_failure_banner(file=sys.stderr):
 _BANNER_COMMANDS = {"new", "continue", "_inner"}
 
 
-def main():
-    if len(sys.argv) < 2:
+KNOWN_COMMANDS = {
+    "new", "continue", "archive", "help", "-h", "--help", "_inner",
+}
+
+
+def _normalize_argv():
+    """Make ark do the obvious thing when a human just wants to get work done.
+
+    ark's whole reason to exist is: "the user wants to get some shit done" — so
+    the common shapes should Just Work rather than fail instantly with a usage
+    dump:
+
+      cat ticket | ark            -> ark new  (feature = piped stdin)
+      ark 'Add a health check'    -> ark new 'Add a health check'
+      ark --driver codex          -> ark new --driver codex (feature from stdin)
+
+    Only bare `ark` at an interactive terminal with nothing piped in is a real
+    "I don't know what you want" — that still prints help.
+
+    Rewrites sys.argv in place so the rest of main() sees an explicit `new`.
+    """
+    argv = sys.argv
+    first = argv[1] if len(argv) > 1 else None
+
+    # Explicit known command (including `new`/`help`): leave it alone.
+    if first in KNOWN_COMMANDS:
+        return
+
+    piped = not sys.stdin.isatty()
+
+    # Nothing to go on: bare `ark` at a tty with no pipe. Show help (exit 1).
+    if first is None and not piped:
         print_help(file=sys.stderr)
         sys.exit(1)
 
+    # Everything else is an implicit `ark new`: a first arg that isn't a known
+    # command (a bare feature string or a lone flag), or no arg but piped stdin.
+    # Splice `new` in as argv[1] so `new`'s own parser handles flags/positional.
+    sys.argv = [argv[0], "new", *argv[1:]]
+
+
+def main():
     cmd = sys.argv[1]
 
     if cmd in ("help", "-h", "--help"):
@@ -2758,6 +2795,12 @@ def main():
         # normal case under the parallel-run model, where bare `continue` can't
         # know which worktree the user means.
         want_slug = sys.argv[2] if len(sys.argv) > 2 else None
+        # Be forgiving about what the user pastes back: ark prints both the slug
+        # and the `ark-<slug>` tmux session name, so a copy-pasted session name
+        # is the obvious mistake. Accept it by stripping the `ark-` prefix rather
+        # than failing with "no run for slug 'ark-...'".
+        if want_slug is not None and want_slug.startswith("ark-"):
+            want_slug = want_slug[len("ark-"):]
 
         # Discover the run worktree(s) created by ark.
         runs = find_ark_worktrees(root)
@@ -2767,6 +2810,12 @@ def main():
             sys.exit(1)
         if want_slug is not None:
             match = [(s, p) for s, p in runs if s == want_slug]
+            if not match:
+                # Fall back to a unique prefix/substring match before giving up,
+                # so a shortened or partially-remembered slug still resolves.
+                fuzzy = [(s, p) for s, p in runs if want_slug in s]
+                if len(fuzzy) == 1:
+                    match = fuzzy
             if not match:
                 print(f"Error: no in-progress ark run for slug '{want_slug}'.",
                       file=sys.stderr)
@@ -2843,6 +2892,11 @@ def main():
 
 
 if __name__ == "__main__":
+    # Normalize BEFORE deciding whether to print the success/failure banner, so
+    # the implicit `ark new` forms (bare `cat ticket | ark`, `ark 'feature'`)
+    # get the banner too. _normalize_argv may exit early (bare `ark` help); that
+    # path is not a pipeline command, so no banner fires.
+    _normalize_argv()
     _is_pipeline = len(sys.argv) >= 2 and sys.argv[1] in _BANNER_COMMANDS
     try:
         main()
