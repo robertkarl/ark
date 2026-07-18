@@ -3,9 +3,9 @@ id: ARK-1
 title: slugify gone
 cti: ark
 severity: 3
-status: open
+status: closed
 created: 2026-07-07T20:13:48Z
-updated: 2026-07-07T20:15:08Z
+updated: 2026-07-08T16:47:45Z
 reporter: Robert Karl
 ---
 
